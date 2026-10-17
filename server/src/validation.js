@@ -34,7 +34,7 @@ export const schemas = {
   }),
   credentialByIdParams: looseObject({
     params: looseObject({ credentialId: z.string().min(1) }),
-    query: looseObject(queryFields),
+    query: looseObject(queryFields).optional(),
   }),
   issueCredential: looseObject({
     body: looseObject({ id: z.string().min(1) }),
