@@ -1653,6 +1653,10 @@ export function createApp({
 
         // ── DID Resolution & Metadata Endpoints (#1067) ────────────────
         if (req.method === "POST" && (pathname === "/dids" || pathname === "/identity/did")) {
+          // These writes land in the DID cache, which resolveDid() reads
+          // before the chain, so an unauthenticated write could poison any
+          // DID's resolved document.
+          if (!await requireAuth(req, res, config, ["admin:write"])) return;
           if (validateContentType(req, res)) return;
           const body = await readJson(req, config);
           if (body.__payloadTooLarge) {
@@ -1720,6 +1724,8 @@ export function createApp({
           }
 
           if (req.method === "PUT" || req.method === "PATCH") {
+            // Same cache-poisoning risk as POST /dids above.
+            if (!await requireAuth(req, res, config, ["admin:write"])) return;
             if (validateContentType(req, res)) return;
             const body = await readJson(req, config);
             if (body.__payloadTooLarge) {
