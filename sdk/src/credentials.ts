@@ -61,6 +61,22 @@ import {
   buildGetMerkleRootArgs,
   buildUpdateMerkleRootArgs,
   buildVerifyMerkleProofArgs,
+  buildRegisterOracleArgs,
+  buildSetFeedSchemaArgs,
+  buildSetOracleFeeArgs,
+  buildSetFallbackOraclesArgs,
+  buildRequestOffchainDataArgs,
+  buildOracleCallbackArgs,
+  buildIsResponseFreshArgs,
+  buildRegisterTemplateArgs,
+  buildPublishTemplateVersionArgs,
+  buildValidateAgainstTemplateArgs,
+  buildListTemplateForSaleArgs,
+  buildBuyTemplateArgs,
+  buildSetSignersArgs,
+  buildUpdateSignersArgs,
+  buildValidateThresholdArgs,
+  buildAggregateSignaturesArgs,
 } from "./contract-args";
 
 const PROBE_ADDRESS = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
@@ -1881,5 +1897,507 @@ export class CredentialClient extends BaseClient {
     return allCredentials
       .filter((cred) => cred.revoked)
       .map((cred) => cred.id);
+  }
+
+  // ---------------------------------------------------------------------------
+  // #1124 — Oracle integration for off-chain data
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Register an oracle node with the credential-manager contract. #1124
+   *
+   * @param adminKeypair  The contract admin signing the transaction.
+   * @param oracleAddress Stellar address of the oracle node.
+   * @param options       Per-call overrides.
+   * @returns `{ txHash }` — the on-chain transaction hash.
+   */
+  async registerOracle(
+    adminKeypair: Keypair,
+    oracleAddress: string,
+    options?: CallOptions
+  ): Promise<{ txHash: string }> {
+    validateStellarAddress(oracleAddress);
+    return this.submitWrite(
+      adminKeypair,
+      'register_oracle',
+      buildRegisterOracleArgs({ admin: adminKeypair.publicKey(), oracle: oracleAddress }),
+      options,
+      'credentials.registerOracle'
+    );
+  }
+
+  /**
+   * Define the data-feed schema for an oracle. #1124
+   */
+  async setFeedSchema(
+    adminKeypair: Keypair,
+    oracleAddress: string,
+    feedId: string,
+    schema: string,
+    options?: CallOptions
+  ): Promise<{ txHash: string }> {
+    validateStellarAddress(oracleAddress);
+    return this.submitWrite(
+      adminKeypair,
+      'set_feed_schema',
+      buildSetFeedSchemaArgs({
+        admin: adminKeypair.publicKey(),
+        oracle: oracleAddress,
+        feedId,
+        schema,
+      }),
+      options,
+      'credentials.setFeedSchema'
+    );
+  }
+
+  /**
+   * Configure the fee charged by an oracle for a data request. #1124
+   */
+  async setOracleFee(
+    adminKeypair: Keypair,
+    oracleAddress: string,
+    feeStroops: number | bigint,
+    options?: CallOptions
+  ): Promise<{ txHash: string }> {
+    validateStellarAddress(oracleAddress);
+    return this.submitWrite(
+      adminKeypair,
+      'set_oracle_fee',
+      buildSetOracleFeeArgs({
+        admin: adminKeypair.publicKey(),
+        oracle: oracleAddress,
+        fee: BigInt(feeStroops),
+      }),
+      options,
+      'credentials.setOracleFee'
+    );
+  }
+
+  /**
+   * Configure the ordered list of fallback oracles used when the primary
+   * oracle is unavailable. #1124
+   */
+  async setFallbackOracles(
+    adminKeypair: Keypair,
+    oracleAddress: string,
+    fallbacks: string[],
+    options?: CallOptions
+  ): Promise<{ txHash: string }> {
+    validateStellarAddress(oracleAddress);
+    for (const fb of fallbacks) validateStellarAddress(fb);
+    return this.submitWrite(
+      adminKeypair,
+      'set_fallback_oracles',
+      buildSetFallbackOraclesArgs({
+        admin: adminKeypair.publicKey(),
+        oracle: oracleAddress,
+        fallbacks,
+      }),
+      options,
+      'credentials.setFallbackOracles'
+    );
+  }
+
+  /**
+   * Request off-chain data from a registered oracle. #1124
+   *
+   * @returns `{ txHash, requestId }` — the transaction hash and the on-chain
+   *   request identifier used to correlate the oracle callback.
+   */
+  async requestOffchainData(
+    requesterKeypair: Keypair,
+    oracleAddress: string,
+    feedId: string,
+    payload: string,
+    options?: CallOptions
+  ): Promise<{ txHash: string; requestId: string }> {
+    validateStellarAddress(oracleAddress);
+    const { txHash, returnValue } = await this.submitWriteWithResult(
+      requesterKeypair,
+      'request_offchain_data',
+      buildRequestOffchainDataArgs({
+        requester: requesterKeypair.publicKey(),
+        oracle: oracleAddress,
+        feedId,
+        payload,
+      }),
+      options,
+      'credentials.requestOffchainData'
+    );
+    const raw = returnValue instanceof Uint8Array ? returnValue : Buffer.alloc(32);
+    return { txHash, requestId: Buffer.from(raw).toString('hex') };
+  }
+
+  /**
+   * Submit an oracle data-verification callback on-chain. #1124
+   *
+   * @param oracleKeypair The oracle node signing the callback.
+   * @param requestId     Hex-encoded request ID returned by {@link requestOffchainData}.
+   * @param dataHashHex   64-char hex SHA-256 of the off-chain data payload.
+   * @param timestamp     Unix seconds at which the data was observed.
+   */
+  async oracleCallback(
+    oracleKeypair: Keypair,
+    requestId: string,
+    dataHashHex: string,
+    timestamp: number,
+    options?: CallOptions
+  ): Promise<{ txHash: string }> {
+    if (!/^[0-9a-fA-F]{64}$/.test(dataHashHex)) {
+      throw new SorobanIdentityError(
+        'InvalidDataHashFormat: dataHash must be a 64-character hex string (32 bytes)',
+        'VALIDATION_ERROR'
+      );
+    }
+    return this.submitWrite(
+      oracleKeypair,
+      'oracle_callback',
+      buildOracleCallbackArgs({
+        oracle: oracleKeypair.publicKey(),
+        requestId: Buffer.from(requestId, 'hex'),
+        dataHash: Buffer.from(dataHashHex, 'hex'),
+        timestamp,
+      }),
+      options,
+      'credentials.oracleCallback'
+    );
+  }
+
+  /**
+   * Check whether an oracle response is still within its staleness window. #1124
+   */
+  async isResponseFresh(
+    callerAddress: string,
+    requestId: string,
+    maxAgeSeconds: number,
+    options?: CallOptions
+  ): Promise<boolean> {
+    const result = await this.simulateRead(
+      callerAddress,
+      'is_response_fresh',
+      buildIsResponseFreshArgs({
+        requestId: Buffer.from(requestId, 'hex'),
+        maxAgeSeconds,
+      }),
+      options
+    );
+    return result === true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // #1125 — Credential templates on-chain
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Register a reusable credential template on-chain. #1125
+   *
+   * @returns `{ txHash, templateId }` — the transaction hash and the new
+   *   template identifier.
+   */
+  async registerTemplate(
+    issuerKeypair: Keypair,
+    name: string,
+    schema: string,
+    parentTemplateId?: string,
+    options?: CallOptions
+  ): Promise<{ txHash: string; templateId: string }> {
+    const { txHash, returnValue } = await this.submitWriteWithResult(
+      issuerKeypair,
+      'register_template',
+      buildRegisterTemplateArgs({
+        issuer: issuerKeypair.publicKey(),
+        name,
+        schema,
+        parentTemplateId,
+      }),
+      options,
+      'credentials.registerTemplate'
+    );
+    const raw = returnValue instanceof Uint8Array ? returnValue : Buffer.alloc(32);
+    return { txHash, templateId: Buffer.from(raw).toString('hex') };
+  }
+
+  /**
+   * Publish a new version of an existing credential template. #1125
+   */
+  async publishTemplateVersion(
+    issuerKeypair: Keypair,
+    templateId: string,
+    schema: string,
+    options?: CallOptions
+  ): Promise<{ txHash: string }> {
+    return this.submitWrite(
+      issuerKeypair,
+      'publish_template_version',
+      buildPublishTemplateVersionArgs({
+        issuer: issuerKeypair.publicKey(),
+        templateId: Buffer.from(templateId, 'hex'),
+        schema,
+      }),
+      options,
+      'credentials.publishTemplateVersion'
+    );
+  }
+
+  /**
+   * Validate a set of claims against an on-chain credential template. #1125
+   *
+   * Read-only simulation; resolves to `true` when the claims satisfy the
+   * template's validation rules (including inherited rules).
+   */
+  async validateAgainstTemplate(
+    callerAddress: string,
+    templateId: string,
+    claims: Record<string, string>,
+    options?: CallOptions
+  ): Promise<boolean> {
+    const result = await this.simulateRead(
+      callerAddress,
+      'validate_against_template',
+      buildValidateAgainstTemplateArgs({
+        templateId: Buffer.from(templateId, 'hex'),
+        claims,
+      }),
+      options
+    );
+    return result === true;
+  }
+
+  /**
+   * List a credential template for sale on the template marketplace. #1125
+   */
+  async listTemplateForSale(
+    issuerKeypair: Keypair,
+    templateId: string,
+    priceStroops: number | bigint,
+    options?: CallOptions
+  ): Promise<{ txHash: string }> {
+    return this.submitWrite(
+      issuerKeypair,
+      'list_template_for_sale',
+      buildListTemplateForSaleArgs({
+        issuer: issuerKeypair.publicKey(),
+        templateId: Buffer.from(templateId, 'hex'),
+        price: BigInt(priceStroops),
+      }),
+      options,
+      'credentials.listTemplateForSale'
+    );
+  }
+
+  /**
+   * Purchase a credential template from the marketplace. #1125
+   */
+  async buyTemplate(
+    buyerKeypair: Keypair,
+    templateId: string,
+    options?: CallOptions
+  ): Promise<{ txHash: string }> {
+    return this.submitWrite(
+      buyerKeypair,
+      'buy_template',
+      buildBuyTemplateArgs({
+        buyer: buyerKeypair.publicKey(),
+        templateId: Buffer.from(templateId, 'hex'),
+      }),
+      options,
+      'credentials.buyTemplate'
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // #1126 — Threshold signature support
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Configure the initial signer set and threshold for an issuer. #1126
+   *
+   * @param signers   Map of signer address → weight.
+   * @param threshold Minimum total weight required to authorize an operation.
+   */
+  async setSigners(
+    adminKeypair: Keypair,
+    issuerAddress: string,
+    signers: Record<string, number>,
+    threshold: number,
+    options?: CallOptions
+  ): Promise<{ txHash: string }> {
+    validateStellarAddress(issuerAddress);
+    for (const addr of Object.keys(signers)) validateStellarAddress(addr);
+    return this.submitWrite(
+      adminKeypair,
+      'set_signers',
+      buildSetSignersArgs({
+        admin: adminKeypair.publicKey(),
+        issuer: issuerAddress,
+        signers,
+        threshold,
+      }),
+      options,
+      'credentials.setSigners'
+    );
+  }
+
+  /**
+   * Update the signer set and/or threshold for an issuer. #1126
+   */
+  async updateSigners(
+    adminKeypair: Keypair,
+    issuerAddress: string,
+    signers: Record<string, number>,
+    threshold: number,
+    options?: CallOptions
+  ): Promise<{ txHash: string }> {
+    validateStellarAddress(issuerAddress);
+    for (const addr of Object.keys(signers)) validateStellarAddress(addr);
+    return this.submitWrite(
+      adminKeypair,
+      'update_signers',
+      buildUpdateSignersArgs({
+        admin: adminKeypair.publicKey(),
+        issuer: issuerAddress,
+        signers,
+        threshold,
+      }),
+      options,
+      'credentials.updateSigners'
+    );
+  }
+
+  /**
+   * Validate that a set of signatures meets the configured threshold. #1126
+   *
+   * Read-only simulation; resolves to `true` when the aggregated signer weight
+   * meets or exceeds the issuer's threshold and no signature has expired.
+   */
+  async validateThreshold(
+    callerAddress: string,
+    issuerAddress: string,
+    messageHashHex: string,
+    signaturesHex: string[],
+    options?: CallOptions
+  ): Promise<boolean> {
+    validateStellarAddress(issuerAddress);
+    if (!/^[0-9a-fA-F]{64}$/.test(messageHashHex)) {
+      throw new SorobanIdentityError(
+        'InvalidMessageHashFormat: messageHash must be a 64-character hex string (32 bytes)',
+        'VALIDATION_ERROR'
+      );
+    }
+    const result = await this.simulateRead(
+      callerAddress,
+      'validate_threshold',
+      buildValidateThresholdArgs({
+        issuer: issuerAddress,
+        messageHash: Buffer.from(messageHashHex, 'hex'),
+        signatures: signaturesHex.map((s) => Buffer.from(s, 'hex')),
+      }),
+      options
+    );
+    return result === true;
+  }
+
+  /**
+   * Aggregate multiple signatures into a single threshold signature. #1126
+   *
+   * @returns The aggregated signature as a hex string.
+   */
+  async aggregateSignatures(
+    callerAddress: string,
+    issuerAddress: string,
+    messageHashHex: string,
+    signaturesHex: string[],
+    options?: CallOptions
+  ): Promise<string> {
+    validateStellarAddress(issuerAddress);
+    if (!/^[0-9a-fA-F]{64}$/.test(messageHashHex)) {
+      throw new SorobanIdentityError(
+        'InvalidMessageHashFormat: messageHash must be a 64-character hex string (32 bytes)',
+        'VALIDATION_ERROR'
+      );
+    }
+    const result = await this.simulateRead(
+      callerAddress,
+      'aggregate_signatures',
+      buildAggregateSignaturesArgs({
+        issuer: issuerAddress,
+        messageHash: Buffer.from(messageHashHex, 'hex'),
+        signatures: signaturesHex.map((s) => Buffer.from(s, 'hex')),
+      }),
+      options
+    );
+    if (result instanceof Uint8Array) return Buffer.from(result).toString('hex');
+    if (typeof result === 'string') return result;
+    throw new SorobanIdentityError(
+      'Unexpected aggregate_signatures return value',
+      'CONTRACT_ERROR'
+    );
+  }
+
+  /**
+   * Build, prepare, sign and submit a state-changing contract call, then wait
+   * for confirmation. Shared by the oracle, template and threshold methods.
+   */
+  private async submitWrite(
+    signerKeypair: Keypair,
+    method: string,
+    args: unknown[],
+    options: CallOptions | undefined,
+    operation: string
+  ): Promise<{ txHash: string }> {
+    const { txHash } = await this.submitWriteWithResult(
+      signerKeypair,
+      method,
+      args,
+      options,
+      operation
+    );
+    return { txHash };
+  }
+
+  /**
+   * Like {@link submitWrite} but also decodes and returns the contract's
+   * return value (used for methods that yield a new on-chain ID).
+   */
+  private async submitWriteWithResult(
+    signerKeypair: Keypair,
+    method: string,
+    args: unknown[],
+    options: CallOptions | undefined,
+    operation: string
+  ): Promise<{ txHash: string; returnValue: unknown }> {
+    const account = await this.server.getAccount(signerKeypair.publicKey());
+    const timeout = options?.timeoutSeconds ?? this.config.txTimeout ?? 30;
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(this.contract.call(method, ...(args as never[])))
+      .setTimeout(timeout)
+      .build();
+
+    try {
+      const prepared = await retryWithBackoff(() => this.server.prepareTransaction(tx));
+      prepared.sign(signerKeypair);
+
+      const result = await retryWithBackoff(() => this.server.sendTransaction(prepared));
+      this.debug('sdk.submission_outcome', { operation, status: result.status });
+      if (result.status !== 'PENDING') {
+        throw new SorobanIdentityError(`Transaction failed: ${result.status}`, 'CONTRACT_ERROR');
+      }
+
+      const txHash = result.hash;
+      await pollTransactionStatus(this.server, txHash);
+
+      const confirmed = await this.server.getTransaction(txHash) as SorobanRpc.Api.GetSuccessfulTransactionResponse;
+      const returnValue = confirmed.returnValue
+        ? scValToNative(confirmed.returnValue)
+        : undefined;
+      return { txHash, returnValue };
+    } catch (e) {
+      throw wrapError(e);
+    }
   }
 }

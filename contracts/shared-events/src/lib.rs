@@ -118,6 +118,26 @@ pub enum EventType {
     EscrowResolved,
     /// Escrow funds were refunded to the depositor
     EscrowRefunded,
+    /// An oracle request was submitted for off-chain data
+    OracleRequested,
+    /// An oracle responded with off-chain data
+    OracleResponded,
+    /// A fallback oracle was used after primary failure
+    OracleFallbackUsed,
+    /// A credential template was registered
+    TemplateRegistered,
+    /// A new version of a credential template was published
+    TemplateVersionPublished,
+    /// A credential template was purchased from the marketplace
+    TemplatePurchased,
+    /// A threshold signer set was updated
+    SignerSetUpdated,
+    /// A threshold signature operation was completed
+    ThresholdSigned,
+    /// A DID method was registered with the resolver
+    DidMethodRegistered,
+    /// A DID was resolved through the resolver
+    DidResolved,
     /// Custom event for extensibility
     Custom(String),
 }
@@ -232,6 +252,116 @@ pub enum EscrowEvent {
     },
 }
 
+/// Oracle-related events emitted by oracle integration contracts.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum OracleEvent {
+    /// An off-chain data request was submitted to an oracle.
+    Requested {
+        request_id: BytesN<32>,
+        requester: Address,
+        /// Identifier of the data feed schema being queried
+        feed_id: BytesN<32>,
+        /// Oracle contract address handling the request
+        oracle: Address,
+        requested_at: u64,
+    },
+    /// An oracle responded with off-chain data.
+    Responded {
+        request_id: BytesN<32>,
+        oracle: Address,
+        /// Hash of the returned data payload for verification
+        data_hash: BytesN<32>,
+        /// Ledger timestamp at which the oracle observed the data
+        observed_at: u64,
+        responded_at: u64,
+    },
+    /// A fallback oracle was used because the primary oracle failed.
+    FallbackUsed {
+        request_id: BytesN<32>,
+        /// Primary oracle that failed
+        primary: Address,
+        /// Fallback oracle that served the request
+        fallback: Address,
+        used_at: u64,
+    },
+}
+
+/// Credential template events emitted by template registry contracts.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum TemplateEvent {
+    /// A new credential template was registered.
+    Registered {
+        template_id: BytesN<32>,
+        owner: Address,
+        /// Parent template this one inherits from (zero hash if none)
+        parent_id: BytesN<32>,
+        registered_at: u64,
+    },
+    /// A new version of a credential template was published.
+    VersionPublished {
+        template_id: BytesN<32>,
+        version: u32,
+        /// Hash of the template schema for this version
+        schema_hash: BytesN<32>,
+        published_at: u64,
+    },
+    /// A credential template was purchased from the marketplace.
+    Purchased {
+        template_id: BytesN<32>,
+        buyer: Address,
+        /// Usage fee paid to the template owner
+        fee: i128,
+        purchased_at: u64,
+    },
+}
+
+/// Threshold signature events emitted by multi-signature contracts.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum ThresholdEvent {
+    /// The signer set or weights were updated.
+    SignerSetUpdated {
+        /// Hash identifying the signer set configuration
+        set_id: BytesN<32>,
+        /// New threshold required for approvals
+        threshold: u32,
+        updated_at: u64,
+    },
+    /// A threshold signature operation was completed.
+    Signed {
+        /// Identifier of the signed operation
+        operation_id: BytesN<32>,
+        /// Number of signers that contributed
+        signer_count: u32,
+        /// Aggregated signature hash
+        signature_hash: BytesN<32>,
+        signed_at: u64,
+    },
+}
+
+/// DID resolver events emitted by the decentralized identifier resolver.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum DidResolverEvent {
+    /// A new DID method was registered with the resolver.
+    MethodRegistered {
+        /// Method name (e.g. "stellar", "key")
+        method: String,
+        /// Resolver contract implementing the method
+        resolver: Address,
+        registered_at: u64,
+    },
+    /// A DID was resolved through the resolver.
+    Resolved {
+        did: String,
+        /// Hash of the resolved DID document
+        document_hash: BytesN<32>,
+        resolved_at: u64,
+    },
+}
+
 /// Top-level event payload that wraps all event types.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -240,6 +370,10 @@ pub enum EventPayload {
     Did(DidEvent),
     Reputation(ReputationEvent),
     Escrow(EscrowEvent),
+    Oracle(OracleEvent),
+    Template(TemplateEvent),
+    Threshold(ThresholdEvent),
+    DidResolver(DidResolverEvent),
     Custom(String),
 }
 
@@ -473,6 +607,36 @@ impl EventEmitter {
                 };
                 env.events().publish((topic, emitter, timestamp), payload);
             }
+            EventPayload::Oracle(oracle_event) => {
+                let topic = match oracle_event {
+                    OracleEvent::Requested { .. } => symbol_short!("orc_req"),
+                    OracleEvent::Responded { .. } => symbol_short!("orc_resp"),
+                    OracleEvent::FallbackUsed { .. } => symbol_short!("orc_fb"),
+                };
+                env.events().publish((topic, emitter, timestamp), payload);
+            }
+            EventPayload::Template(template_event) => {
+                let topic = match template_event {
+                    TemplateEvent::Registered { .. } => symbol_short!("tpl_reg"),
+                    TemplateEvent::VersionPublished { .. } => symbol_short!("tpl_ver"),
+                    TemplateEvent::Purchased { .. } => symbol_short!("tpl_buy"),
+                };
+                env.events().publish((topic, emitter, timestamp), payload);
+            }
+            EventPayload::Threshold(threshold_event) => {
+                let topic = match threshold_event {
+                    ThresholdEvent::SignerSetUpdated { .. } => symbol_short!("thr_set"),
+                    ThresholdEvent::Signed { .. } => symbol_short!("thr_sign"),
+                };
+                env.events().publish((topic, emitter, timestamp), payload);
+            }
+            EventPayload::DidResolver(resolver_event) => {
+                let topic = match resolver_event {
+                    DidResolverEvent::MethodRegistered { .. } => symbol_short!("did_mreg"),
+                    DidResolverEvent::Resolved { .. } => symbol_short!("did_res"),
+                };
+                env.events().publish((topic, emitter, timestamp), payload);
+            }
             EventPayload::Custom(msg) => {
                 env.events()
                     .publish((symbol_short!("custom"), emitter, timestamp), msg.clone());
@@ -502,6 +666,24 @@ impl EventEmitter {
                 EscrowEvent::Disputed { .. } => EventType::EscrowDisputed,
                 EscrowEvent::Resolved { .. } => EventType::EscrowResolved,
                 EscrowEvent::Refunded { .. } => EventType::EscrowRefunded,
+            },
+            EventPayload::Oracle(oracle) => match oracle {
+                OracleEvent::Requested { .. } => EventType::OracleRequested,
+                OracleEvent::Responded { .. } => EventType::OracleResponded,
+                OracleEvent::FallbackUsed { .. } => EventType::OracleFallbackUsed,
+            },
+            EventPayload::Template(template) => match template {
+                TemplateEvent::Registered { .. } => EventType::TemplateRegistered,
+                TemplateEvent::VersionPublished { .. } => EventType::TemplateVersionPublished,
+                TemplateEvent::Purchased { .. } => EventType::TemplatePurchased,
+            },
+            EventPayload::Threshold(threshold) => match threshold {
+                ThresholdEvent::SignerSetUpdated { .. } => EventType::SignerSetUpdated,
+                ThresholdEvent::Signed { .. } => EventType::ThresholdSigned,
+            },
+            EventPayload::DidResolver(resolver) => match resolver {
+                DidResolverEvent::MethodRegistered { .. } => EventType::DidMethodRegistered,
+                DidResolverEvent::Resolved { .. } => EventType::DidResolved,
             },
             EventPayload::Custom(msg) => EventType::Custom(msg.clone()),
         }
