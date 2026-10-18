@@ -46,6 +46,16 @@ pub enum IdentityRegistryError {
     DisputeAlreadyResolved = 15,
     /// The escrow amount is invalid (e.g. zero or negative).
     InvalidEscrowAmount = 16,
+    /// The DID method in the supplied DID is not supported.
+    UnknownDidMethod = 17,
+    /// The resolved DID document failed validation.
+    InvalidDidDocument = 18,
+    /// The requested resolver plugin was not found.
+    ResolverPluginNotFound = 19,
+    /// The resolver fallback chain was exhausted without a result.
+    FallbackChainExhausted = 20,
+    /// The requested DID was not present in the resolver cache.
+    CacheMiss = 21,
 }
 
 /// Errors returned by the credential-manager contract.
@@ -69,4 +79,32 @@ pub enum CredentialManagerError {
     AlreadyInitialized = 7,
     /// The supplied input failed validation.
     InvalidInput = 8,
+    /// The supplied bitmap index is out of range.
+    InvalidBitmapIndex = 9,
+    /// The supplied batch exceeds the maximum allowed size.
+    BatchTooLarge = 10,
+    /// The supplied revocation proof is invalid.
+    RevocationProofInvalid = 11,
+    /// The supplied merkle proof is invalid.
+    MerkleProofInvalid = 12,
+    /// The supplied stake is insufficient for the operation.
+    InsufficientStake = 13,
+    /// The unstake cooldown period is still active.
+    UnstakeCooldownActive = 14,
+    /// The slash amount exceeds the maximum allowed.
+    SlashExceedsMax = 15,
+    /// The requested delegation was not found.
+    DelegationNotFound = 16,
+    /// The staking reward pool is empty.
+    RewardPoolEmpty = 17,
+    /// The supplied presentation is malformed.
+    InvalidPresentation = 18,
+    /// The presentation challenge does not match.
+    ChallengeMismatch = 19,
+    /// The presentation has expired.
+    PresentationExpired = 20,
+    /// The presentation proof format is not supported.
+    UnsupportedProofFormat = 21,
+    /// The requested presentation template was not found.
+    TemplateNotFound = 22,
 }
