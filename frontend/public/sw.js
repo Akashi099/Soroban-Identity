@@ -1,14 +1,70 @@
 // Service Worker for Soroban Identity PWA
 // Handles offline caching and sync
 
-const CACHE_VERSION = 'v1';
+const CACHE_VERSION = 'v2';
 const CACHE_NAME = `soroban-identity-${CACHE_VERSION}`;
+const STATIC_CACHE_NAME = `soroban-identity-static-${CACHE_VERSION}`;
+const API_CACHE_NAME = `soroban-identity-api-${CACHE_VERSION}`;
 const STATIC_ASSETS = [
   '/',
   '/index.html',
   '/manifest.json',
   '/vite-env.d.ts',
 ];
+
+// TTLs per data type (milliseconds) - aligned with L2/L3 cache policies
+const CACHE_TTLS = {
+  static: 7 * 24 * 60 * 60 * 1000, // 7 days for static assets
+  api: 5 * 60 * 1000, // 5 minutes for API responses
+  public: 60 * 60 * 1000, // 1 hour for public data
+};
+
+// Cache hit rate monitoring counters
+const cacheStats = {
+  hits: 0,
+  misses: 0,
+  revalidations: 0,
+};
+
+function recordCacheHit() {
+  cacheStats.hits += 1;
+}
+
+function recordCacheMiss() {
+  cacheStats.misses += 1;
+}
+
+function recordRevalidation() {
+  cacheStats.revalidations += 1;
+}
+
+function getCacheHitRate() {
+  const total = cacheStats.hits + cacheStats.misses;
+  return total === 0 ? 0 : cacheStats.hits / total;
+}
+
+// Store a response with a timestamp header for TTL-based expiry
+async function putWithTimestamp(cacheName, request, response) {
+  const headers = new Headers(response.headers);
+  headers.set('x-sw-cached-at', Date.now().toString());
+  const body = await response.clone().blob();
+  const cachedResponse = new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+  const cache = await caches.open(cacheName);
+  await cache.put(request, cachedResponse);
+}
+
+// Check whether a cached response has exceeded its TTL
+function isExpired(response, ttl) {
+  const cachedAt = response.headers.get('x-sw-cached-at');
+  if (!cachedAt) {
+    return true;
+  }
+  return Date.now() - parseInt(cachedAt, 10) > ttl;
+}
 
 // Install event - cache static assets
 self.addEventListener('install', (event) => {
@@ -24,11 +80,12 @@ self.addEventListener('install', (event) => {
 
 // Activate event - clean up old caches
 self.addEventListener('activate', (event) => {
+  const currentCaches = [CACHE_NAME, STATIC_CACHE_NAME, API_CACHE_NAME];
   event.waitUntil(
     caches.keys().then((cacheNames) => {
       return Promise.all(
         cacheNames.map((cacheName) => {
-          if (cacheName !== CACHE_NAME) {
+          if (!currentCaches.includes(cacheName)) {
             return caches.delete(cacheName);
           }
         })
@@ -48,41 +105,49 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Network first strategy for API calls
+  // Network first strategy for API calls (with cache fallback)
   if (event.request.url.includes('/api/')) {
     event.respondWith(
       fetch(event.request)
         .then((response) => {
-          // Cache successful responses
+          // Cache successful responses with TTL metadata
           if (response && response.status === 200) {
-            const responseClone = response.clone();
-            caches.open(CACHE_NAME).then((cache) => {
-              cache.put(event.request, responseClone);
+            putWithTimestamp(API_CACHE_NAME, event.request, response).catch((error) => {
+              console.warn('Failed to cache API response:', error);
             });
           }
           return response;
         })
-        .catch(() => {
+        .catch(async () => {
           // Fall back to cache when offline
-          return caches.match(event.request);
+          const cached = await caches.match(event.request);
+          if (cached) {
+            recordCacheHit();
+            return cached;
+          }
+          recordCacheMiss();
+          return new Response(
+            JSON.stringify({ error: 'Offline - no cached response available' }),
+            {
+              status: 503,
+              statusText: 'Service Unavailable',
+              headers: new Headers({ 'Content-Type': 'application/json' }),
+            }
+          );
         })
     );
     return;
   }
 
-  // Cache first strategy for static assets
+  // Stale-while-revalidate strategy for static assets
   event.respondWith(
-    caches.match(event.request).then((response) => {
-      if (response) {
-        return response;
-      }
-      return fetch(event.request)
+    caches.match(event.request).then((cachedResponse) => {
+      const networkFetch = fetch(event.request)
         .then((response) => {
-          // Cache new static assets
+          // Cache new static assets with TTL metadata
           if (response && response.status === 200) {
-            const responseClone = response.clone();
-            caches.open(CACHE_NAME).then((cache) => {
-              cache.put(event.request, responseClone);
+            putWithTimestamp(STATIC_CACHE_NAME, event.request, response).catch((error) => {
+              console.warn('Failed to cache static asset:', error);
             });
           }
           return response;
@@ -99,6 +164,21 @@ self.addEventListener('fetch', (event) => {
             });
           });
         });
+
+      if (cachedResponse) {
+        recordCacheHit();
+        // Serve stale content immediately, revalidate in background
+        if (isExpired(cachedResponse, CACHE_TTLS.static)) {
+          recordRevalidation();
+          event.waitUntil(networkFetch.catch(() => undefined));
+        } else {
+          event.waitUntil(networkFetch.catch(() => undefined));
+        }
+        return cachedResponse;
+      }
+
+      recordCacheMiss();
+      return networkFetch;
     })
   );
 });
@@ -238,8 +318,43 @@ self.addEventListener('notificationclick', (event) => {
 
 // Message handler for client communication
 self.addEventListener('message', (event) => {
-  if (event.data && event.data.type === 'SKIP_WAITING') {
+  if (!event.data) {
+    return;
+  }
+
+  if (event.data.type === 'SKIP_WAITING') {
     self.skipWaiting();
+  }
+
+  // Report cache hit rate monitoring stats to clients
+  if (event.data.type === 'GET_CACHE_STATS') {
+    event.source?.postMessage({
+      type: 'CACHE_STATS',
+      stats: {
+        ...cacheStats,
+        hitRate: getCacheHitRate(),
+      },
+    });
+  }
+
+  // Cache invalidation pipeline: purge a specific URL or all caches
+  if (event.data.type === 'INVALIDATE_CACHE') {
+    event.waitUntil(
+      (async () => {
+        if (event.data.url) {
+          await Promise.all([
+            caches.open(STATIC_CACHE_NAME).then((cache) => cache.delete(event.data.url)),
+            caches.open(API_CACHE_NAME).then((cache) => cache.delete(event.data.url)),
+          ]);
+        } else {
+          await Promise.all([
+            caches.delete(STATIC_CACHE_NAME),
+            caches.delete(API_CACHE_NAME),
+          ]);
+        }
+        event.source?.postMessage({ type: 'CACHE_INVALIDATED', url: event.data.url || null });
+      })()
+    );
   }
 });
 
