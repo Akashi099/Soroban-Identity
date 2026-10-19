@@ -15,8 +15,8 @@ pub struct MetadataKey {
     pub public_key: Bytes,
     pub created_at: u64,
     pub revoked: bool,
-    /// Key id that replaced this one on rotation, if any.
-    pub rotated_to: Option<BytesN<32>>,
+    /// Key id that replaced this one on rotation; all zeros when not rotated.
+    pub rotated_to: BytesN<32>,
 }
 
 #[contracttype]
@@ -59,7 +59,7 @@ pub fn register_key(
         public_key,
         created_at: env.ledger().timestamp(),
         revoked: false,
-        rotated_to: None,
+        rotated_to: BytesN::from_array(env, &[0; 32]),
     };
     env.storage().persistent().set(&DataKey::Key(key_id), &key);
     Ok(())
@@ -76,7 +76,7 @@ pub fn rotate_key(
     let mut old = owned_active_key(env, &owner, &old_key_id)?;
     register_key(env, owner, new_key_id.clone(), public_key)?;
     old.revoked = true;
-    old.rotated_to = Some(new_key_id.clone());
+    old.rotated_to = new_key_id.clone();
     env.storage().persistent().set(&DataKey::Key(old_key_id.clone()), &old);
     env.events()
         .publish((symbol_short!("key_rot"), old_key_id), new_key_id);
