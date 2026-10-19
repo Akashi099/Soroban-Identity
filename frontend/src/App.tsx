@@ -1,8 +1,31 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { lazy, Suspense, useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { SorobanRpc } from "@stellar/stellar-sdk";
-import IdentityPanel from "./components/IdentityPanel";
-import CredentialsPanel from "./components/CredentialsPanel";
+import LoadingFallback from "./components/LoadingFallback";
+import KeyboardShortcutsModal from "./components/KeyboardShortcutsModal";
+import { useKeyboardShortcuts, useSequentialShortcuts } from "./hooks/useKeyboardShortcuts";
+import { useKeyboardShortcutsContext } from "./context/KeyboardShortcutsContext";
+import ViewTransition from "./components/ViewTransition";
+import VoiceCommandButton from "./components/VoiceCommandButton";
+import { useVoiceCommands, type VoiceCommand } from "./hooks/useVoiceCommands";
+
+// Tab panels are route-like application surfaces. Keep the initial identity
+// route small and fetch the credentials route only when it is needed.
+const IdentityPanel = lazy(() => import("./components/IdentityPanel"));
+const CredentialsPanel = lazy(() => import("./components/CredentialsPanel"));
+const IssuerDashboard = lazy(() => import("./pages/IssuerDashboard"));
+const CredentialRecipientVerify = lazy(() => import("./components/CredentialRecipientVerify"));
+const NetworkStatistics = lazy(() => import("./pages/NetworkStatistics"));
+
+const preloadCredentialsPanel = () => {
+  void import("./components/CredentialsPanel");
+};
+const preloadCredentialRecipientVerify = () => {
+  void import("./components/CredentialRecipientVerify");
+};
+const preloadNetworkStatistics = () => {
+  void import("./pages/NetworkStatistics");
+};
 import WalletButton from "./components/WalletButton";
 import ErrorBoundary from "./components/ErrorBoundary";
 import Toast from "./components/Toast";
@@ -10,6 +33,8 @@ import { ToastProvider } from "./context/ToastContext";
 import { useWallet } from "./hooks/useWallet";
 import { useCredentialExpiryCheck } from "./hooks/useCredentialExpiryCheck";
 import { useTheme, cycleTheme, getThemeIcon, getThemeLabel } from "./hooks/useTheme";
+import { useServiceWorker } from "./hooks/useServiceWorker";
+import OfflineIndicator from "./components/OfflineIndicator";
 import {
   DEFAULT_NETWORK,
   NETWORK_CONFIGS,
@@ -19,41 +44,155 @@ import {
 } from "./network";
 import { checkConnection, IdentityClient, CredentialClient, ReputationClient } from "../../sdk/src/index";
 import { setLocale } from "./i18n";
+import { useOpenGraphMeta } from "./hooks/useOpenGraphMeta";
+import { SHARE_DESCRIPTION, SHARE_TITLE, buildVerificationUrl } from "./utils/socialShare";
 import type { Credential } from "../../sdk/src/types";
 
 const SUPPORTED_LOCALES: { code: string; label: string }[] = [
   { code: "en", label: "EN" },
   { code: "es", label: "ES" },
+  { code: "fr", label: "FR" },
+  { code: "zh", label: "中文" },
 ];
 
 export enum Tab {
   Identity = "identity",
   Credentials = "credentials",
+  IssuerAnalytics = "issuerAnalytics",
+  NetworkStatistics = "networkStatistics",
 }
 
-const TAB_ORDER: Tab[] = [Tab.Identity, Tab.Credentials];
+const TAB_ORDER: Tab[] = [Tab.Identity, Tab.Credentials, Tab.IssuerAnalytics, Tab.NetworkStatistics];
 
-export default function App() {
+function AppContent() {
   const [tab, setTab] = useState<Tab>(Tab.Identity);
   const tabRefs = useRef<Partial<Record<Tab, HTMLButtonElement | null>>>({});
   const [activeNetwork, setActiveNetwork] = useState<NetworkName>(DEFAULT_NETWORK);
   const [verifyId, setVerifyId] = useState<string | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [deepLinkEncrypted, setDeepLinkEncrypted] = useState<{ c: string; k: string } | null>(null);
   const networkConfig = NETWORK_CONFIGS[activeNetwork];
   const wallet = useWallet(networkConfig);
   const [theme, setTheme, isDarkMode] = useTheme();
   const { t, i18n } = useTranslation();
   const [isConnected, setIsConnected] = useState<boolean | null>(null);
   const [uninitializedContracts, setUninitializedContracts] = useState<string[]>([]);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuButtonRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  
+  // Keyboard shortcuts
+  const { enabled: shortcutsEnabled, toggleHelp: toggleShortcutsHelp, showHelp: showShortcutsHelp } = useKeyboardShortcutsContext();
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Voice commands (#1046): hands-free search, navigation and verification.
+  const voiceCommands = useMemo<VoiceCommand[]>(
+    () => [
+      {
+        phrases: ["search", "find", "buscar", "rechercher", "搜索"],
+        description: t("voice.commands.search"),
+        handler: () => {
+          searchInputRef.current?.focus();
+        },
+      },
+      {
+        phrases: ["navigate", "go to", "open", "navegar", "aller", "导航"],
+        description: t("voice.commands.navigate"),
+        handler: (transcript) => {
+          const target = transcript.toLowerCase();
+          if (target.includes("credential")) {
+            setTab(Tab.Credentials);
+          } else if (target.includes("issuer") || target.includes("analytics")) {
+            setTab(Tab.IssuerAnalytics);
+          } else {
+            setTab(Tab.Identity);
+          }
+        },
+      },
+      {
+        phrases: ["verify", "verificar", "vérifier", "验证"],
+        description: t("voice.commands.verify"),
+        handler: () => {
+          setTab(Tab.Credentials);
+          setScanning(true);
+        },
+      },
+    ],
+    [t],
+  );
+
+  const voice = useVoiceCommands({ commands: voiceCommands });
+
+  // Mobile nav drawer (#882): while open, focus moves into the drawer and
+  // Tab cycles inside it, the page behind does not scroll, and Escape closes
+  // it. Closing returns focus to the menu button.
+  const wasMenuOpen = useRef(false);
+  useEffect(() => {
+    if (!menuOpen) {
+      if (wasMenuOpen.current) menuButtonRef.current?.focus();
+      wasMenuOpen.current = false;
+      return;
+    }
+    wasMenuOpen.current = true;
+    const root = document.documentElement;
+    root.classList.add("nav-open");
+    const focusable = () =>
+      Array.from(
+        menuRef.current?.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), select:not([disabled]), a[href], input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
+    focusable()[0]?.focus();
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setMenuOpen(false);
+        return;
+      }
+      if (e.key !== "Tab") return;
+      // The menu button stays above the drawer as its close control, so it is
+      // part of the cycle.
+      const items = [menuButtonRef.current, ...focusable()].filter(
+        (el): el is HTMLElement => el !== null,
+      );
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last?.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first?.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      root.classList.remove("nav-open");
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menuOpen]);
 
   // Check for verify query param on load
   useEffect(() => {
     const urlParams = new URLSearchParams(window.location.search);
     const verifyParam = urlParams.get("verify");
-    if (verifyParam) {
+    const cParam = urlParams.get("c");
+    const kParam = urlParams.get("k");
+
+    if (cParam && kParam) {
+      setDeepLinkEncrypted({ c: cParam, k: kParam });
+      setTab(Tab.Credentials);
+    } else if (verifyParam) {
       setVerifyId(verifyParam);
       setTab(Tab.Credentials);
     }
   }, []);
+
+  // #948: link preview metadata for shared `?verify=<id>` links.
+  const verifyMeta = useMemo(
+    () => (verifyId ? { title: SHARE_TITLE, description: SHARE_DESCRIPTION, url: buildVerificationUrl(verifyId) } : null),
+    [verifyId]
+  );
+  useOpenGraphMeta(verifyMeta);
 
   const onMainnet = isMainnet(activeNetwork);
 
@@ -98,7 +237,7 @@ export default function App() {
     [],
   );
 
-  const { notification, dismiss } = useCredentialExpiryCheck(
+  const { notification, dismiss, markAllAsRead } = useCredentialExpiryCheck(
     wallet.publicKey,
     fetchCredentials,
   );
@@ -135,55 +274,124 @@ export default function App() {
     tabRefs.current[nextTab]?.focus();
   };
 
+  // Register keyboard shortcuts
+  useKeyboardShortcuts({
+    enabled: shortcutsEnabled,
+    shortcuts: [
+      {
+        key: 'k',
+        ctrl: true,
+        description: t('shortcuts.search'),
+        category: 'actions',
+        handler: () => {
+          // Focus search input if it exists
+          searchInputRef.current?.focus();
+        },
+      },
+      {
+        key: 'n',
+        ctrl: true,
+        description: t('shortcuts.createCredential'),
+        category: 'actions',
+        handler: () => {
+          // Switch to credentials tab
+          setTab(Tab.Credentials);
+          // Note: Actual credential creation would be triggered in CredentialsPanel
+        },
+      },
+      {
+        key: 't',
+        ctrl: true,
+        shift: true,
+        description: t('shortcuts.toggleTheme'),
+        category: 'ui',
+        handler: () => {
+          setTheme(cycleTheme(theme));
+        },
+      },
+      {
+        key: '?',
+        description: t('shortcuts.showHelp'),
+        category: 'ui',
+        handler: () => {
+          toggleShortcutsHelp();
+        },
+      },
+      {
+        key: '/',
+        ctrl: true,
+        description: t('shortcuts.showHelp'),
+        category: 'ui',
+        handler: () => {
+          toggleShortcutsHelp();
+        },
+      },
+      {
+        key: 'Escape',
+        description: t('shortcuts.closeDialog'),
+        category: 'ui',
+        handler: () => {
+          if (showShortcutsHelp) {
+            toggleShortcutsHelp();
+          } else if (menuOpen) {
+            setMenuOpen(false);
+          }
+        },
+        preventDefault: false,
+      },
+    ],
+  });
+
+  // Sequential shortcuts for navigation (g+d, g+c)
+  useSequentialShortcuts({
+    'g,d': () => {
+      setTab(Tab.Identity);
+      tabRefs.current[Tab.Identity]?.focus();
+    },
+    'g,c': () => {
+      setTab(Tab.Credentials);
+      tabRefs.current[Tab.Credentials]?.focus();
+    },
+  }, { enabled: shortcutsEnabled });
+
   return (
     <ToastProvider>
       <Toast />
+      <KeyboardShortcutsModal isOpen={showShortcutsHelp} onClose={toggleShortcutsHelp} />
       <a className="skip-link" href="#main-content">
         {t("a11y.skipToContent")}
       </a>
       <div className="container">
-      <header style={{ position: "relative" }}>
-        <h1>{t("app.title")}</h1>
-        <p>{t("app.subtitle")}</p>
+      <header className="app-header">
+        <div className="app-header__brand">
+          <h1>{t("app.title")}</h1>
+          <p>{t("app.subtitle")}</p>
+        </div>
+        <button
+          ref={menuButtonRef}
+          type="button"
+          className="hamburger-btn"
+          aria-label={menuOpen ? "Close menu" : "Open menu"}
+          aria-expanded={menuOpen}
+          aria-controls="mobile-header-actions"
+          onClick={() => setMenuOpen((v) => !v)}
+        >
+          <span className={`hamburger-icon${menuOpen ? " open" : ""}`} />
+        </button>
+        {/* Layout lives in styles/navigation.css: a drawer on phones, inline
+            from 768px up. Inline styles here would override it. */}
         <div
-          style={{
-            position: "absolute",
-            top: "1rem",
-            right: 0,
-            display: "flex",
-            gap: "0.5rem",
-            alignItems: "center",
-          }}
+          id="mobile-header-actions"
+          ref={menuRef}
+          className={`header-actions${menuOpen ? " open" : ""}`}
         >
           {isConnected !== null && (
             <div
               role="status"
               aria-live="polite"
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "0.5rem",
-                padding: "0.4rem 0.8rem",
-                borderRadius: "0.25rem",
-                backgroundColor: isConnected
-                  ? "var(--success-bg, #d4edda)"
-                  : "var(--danger-bg, #f8d7da)",
-                color: isConnected
-                  ? "var(--success-text, #155724)"
-                  : "var(--danger-text, #721c24)",
-                fontSize: "0.85rem",
-              }}
+              className={`network-status${isConnected ? " is-online" : ""}`}
             >
-              <span
-                aria-hidden="true"
-                style={{
-                  display: "inline-block",
-                  width: "8px",
-                  height: "8px",
-                  borderRadius: "50%",
-                  backgroundColor: isConnected ? "#28a745" : "#dc3545",
-                }}
-              />
+              <span aria-hidden="true" className="network-status__dot" />
               {isConnected ? t("app.networkOnline") : t("app.networkOffline")}
             </div>
           )}
@@ -191,7 +399,6 @@ export default function App() {
             value={i18n.language}
             onChange={handleLocaleChange}
             aria-label={t("a11y.switchLanguage")}
-            style={{ padding: "0.3rem 0.5rem", borderRadius: "0.25rem", fontSize: "0.85rem" }}
           >
             {SUPPORTED_LOCALES.map(({ code, label }) => (
               <option key={code} value={code}>{label}</option>
@@ -219,9 +426,36 @@ export default function App() {
           >
             {getThemeIcon(theme, isDarkMode)} {getThemeLabel(theme, isDarkMode, t)}
           </button>
+          {notification && !notification.dismissed && notification.count > 0 && (
+            <span
+              className="notification-badge-icon"
+              data-testid="notification-badge"
+              aria-label={`${notification.count} notification${notification.count > 1 ? "s" : ""}`}
+              style={{
+                position: "relative",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "0.25rem",
+                fontSize: "0.85rem",
+                fontWeight: 600,
+              }}
+            >
+              <span aria-hidden="true">🔔</span>
+              <span className="badge badge-yellow" data-testid="notification-badge-count">
+                {notification.count}
+              </span>
+            </span>
+          )}
           <WalletButton wallet={wallet} />
         </div>
+        <div
+          className={`mobile-drawer-backdrop${menuOpen ? " open" : ""}`}
+          onClick={() => setMenuOpen(false)}
+          aria-hidden="true"
+        />
       </header>
+
+      <OfflineIndicator />
 
       {uninitializedContracts.length > 0 && (
         <div
@@ -270,7 +504,7 @@ export default function App() {
         </div>
       )}
 
-      {notification && !notification.dismissed && (
+      {notification && !notification.dismissed && notification.count > 0 && (
         <div
           role="alert"
           style={{
@@ -287,22 +521,43 @@ export default function App() {
           }}
         >
           <span>
-            <span aria-hidden="true">⚠</span> {notification.count} credential
+            <span aria-hidden="true">⚠</span>{" "}
+            <span className="notification-badge" data-testid="notification-badge-count">
+              {notification.count}
+            </span>{" "}
+            credential
             {notification.count > 1 ? "s" : ""} expiring within 7 days
           </span>
-          <button
-            onClick={dismiss}
-            aria-label={t("a11y.dismissNotification")}
-            style={{
-              background: "none",
-              border: "none",
-              cursor: "pointer",
-              fontSize: "1rem",
-              color: "inherit",
-            }}
-          >
-            ✕
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+            <button
+              type="button"
+              onClick={markAllAsRead}
+              style={{
+                background: "none",
+                border: "1px solid currentColor",
+                borderRadius: "0.25rem",
+                padding: "0.2rem 0.5rem",
+                cursor: "pointer",
+                fontSize: "0.8rem",
+                color: "inherit",
+              }}
+            >
+              Mark all as read
+            </button>
+            <button
+              onClick={dismiss}
+              aria-label={t("a11y.dismissNotification")}
+              style={{
+                background: "none",
+                border: "none",
+                cursor: "pointer",
+                fontSize: "1rem",
+                color: "inherit",
+              }}
+            >
+              ✕
+            </button>
+          </div>
         </div>
       )}
 
@@ -327,7 +582,22 @@ export default function App() {
             ref={(node) => {
               tabRefs.current[name] = node;
             }}
+            data-tour={`tab-${name}`}
             onClick={() => setTab(name)}
+            onMouseEnter={
+              name === Tab.Credentials
+                ? preloadCredentialsPanel
+                : name === Tab.NetworkStatistics
+                  ? preloadNetworkStatistics
+                  : undefined
+            }
+            onFocus={
+              name === Tab.Credentials
+                ? preloadCredentialsPanel
+                : name === Tab.NetworkStatistics
+                  ? preloadNetworkStatistics
+                  : undefined
+            }
           >
             {t(`tabs.${name}`)}
           </button>
@@ -336,10 +606,13 @@ export default function App() {
 
       <main id="main-content" tabIndex={-1}>
         <ErrorBoundary>
+          <Suspense fallback={<LoadingFallback />}>
+          <ViewTransition viewKey={tab}>
           <div
             id={`panel-${Tab.Identity}`}
             role="tabpanel"
             aria-labelledby={`tab-${Tab.Identity}`}
+            data-tour="panel-identity"
             hidden={tab !== Tab.Identity}
           >
             {tab === Tab.Identity && <IdentityPanel />}
@@ -348,13 +621,57 @@ export default function App() {
             id={`panel-${Tab.Credentials}`}
             role="tabpanel"
             aria-labelledby={`tab-${Tab.Credentials}`}
+            data-tour="panel-credentials"
             hidden={tab !== Tab.Credentials}
           >
-            {tab === Tab.Credentials && <CredentialsPanel verifyId={verifyId} />}
+            {tab === Tab.Credentials && (
+              <>
+                {deepLinkEncrypted && (
+                  <CredentialRecipientVerify
+                    ciphertext={deepLinkEncrypted.c}
+                    secretKey={deepLinkEncrypted.k}
+                    onClose={() => setDeepLinkEncrypted(null)}
+                  />
+                )}
+                <button type="button" onClick={() => setScanning((v) => !v)}>
+                  Scan QR
+                </button>
+                {scanning && (
+                  <QRScanner
+                    onVerify={(id) => {
+                      setVerifyId(id);
+                      setScanning(false);
+                    }}
+                    onClose={() => setScanning(false)}
+                  />
+                )}
+                <CredentialsPanel verifyId={verifyId} />
+              </>
+            )}
           </div>
+          <div
+            id={`panel-${Tab.IssuerAnalytics}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${Tab.IssuerAnalytics}`}
+            data-tour="panel-issuer"
+            hidden={tab !== Tab.IssuerAnalytics}
+          >
+            {tab === Tab.IssuerAnalytics && <IssuerDashboard />}
+          </div>
+          </ViewTransition>
+          </Suspense>
         </ErrorBoundary>
       </main>
     </div>
     </ToastProvider>
+  );
+}
+
+export default function App() {
+  return (
+    <TourProvider>
+      <AppContent />
+      <TourOverlay />
+    </TourProvider>
   );
 }

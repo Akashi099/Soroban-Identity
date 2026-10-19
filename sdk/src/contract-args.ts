@@ -11,6 +11,12 @@
 
 import { nativeToScVal, xdr } from '@stellar/stellar-sdk';
 import type { CredentialType } from './types';
+import {
+  REVOCATION_REASONS,
+  isRevocationReason,
+  type RevocationReason,
+} from './types';
+import { SorobanIdentityError } from './errors';
 import { encodeI64, encodeU64 } from './codec';
 
 // ── identity-registry ────────────────────────────────────────────────────────
@@ -101,7 +107,7 @@ export function buildDidExistsArgs(params: {
 
 /**
  * Build args for `issue_credential(issuer, subject, credential_type, claims,
- * claims_hash, signature, expires_at)`.
+ * claims_hash, signature, expires_at, schema_hash, activation_time)`.
  *
  * @param params.issuer         Registered issuer address (must sign the tx).
  * @param params.subject        Subject receiving the credential.
@@ -110,6 +116,9 @@ export function buildDidExistsArgs(params: {
  * @param params.claimsHash     32-byte SHA-256 of the off-chain claims payload.
  * @param params.signature      64-byte issuer Ed25519 signature.
  * @param params.expiresAt      Unix timestamp (seconds); `0` for no expiry.
+ * @param params.schemaHash     Optional 32-byte registered schema hash buffer.
+ * @param params.activationTime Unix timestamp (seconds) before which the credential
+ *                              is inactive. `0` means immediately active (no time-lock). #731
  * @returns ScVal array ready for `contract.call('issue_credential', ...)`.
  */
 export function buildIssueCredentialArgs(params: {
@@ -120,8 +129,15 @@ export function buildIssueCredentialArgs(params: {
   claimsHash: Buffer;
   signature: Buffer;
   expiresAt: bigint;
+  schemaHash?: Buffer | null;
+  activationTime?: bigint;
 }): xdr.ScVal[] {
   const expiresAt = encodeU64(params.expiresAt);
+  const activationTime = encodeU64(params.activationTime ?? 0n);
+  // schema_hash is Option<BytesN<32>>: None = scvVoid, Some(v) = bytes ScVal
+  const schemaHashVal = params.schemaHash
+    ? nativeToScVal(params.schemaHash, { type: 'bytes' })
+    : xdr.ScVal.scvVoid();
   return [
     nativeToScVal(params.issuer, { type: 'address' }),
     nativeToScVal(params.subject, { type: 'address' }),
@@ -130,24 +146,74 @@ export function buildIssueCredentialArgs(params: {
     nativeToScVal(params.claimsHash, { type: 'bytes' }),
     nativeToScVal(params.signature, { type: 'bytes' }),
     expiresAt,
+    schemaHashVal,
+    activationTime,
   ];
 }
 
 /**
- * Build args for `revoke_credential(issuer, credential_id)`.
+ * Encode a {@link RevocationReason} the way the contract decodes it.
+ *
+ * `#[contracttype]` unit-variant enums travel as a one-element vector holding
+ * the variant name as a symbol — `Vector[Symbol("Superseded")]`. Sending a bare
+ * symbol (what this SDK did before #937) is rejected by the host, which is why
+ * `revoke_credentials_batch` could not be called with a reason before.
+ */
+export function encodeRevocationReason(reason: RevocationReason): xdr.ScVal {
+  if (!isRevocationReason(reason)) {
+    throw new SorobanIdentityError(
+      `Unknown revocation reason ${String(reason)} — expected one of ${REVOCATION_REASONS.join(', ')}`,
+      'INVALID_ARGUMENT'
+    );
+  }
+  return xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(reason)]);
+}
+
+/**
+ * Build args for `revoke_credential(issuer, credential_id, reason)`.
  *
  * @param params.issuer       Registered issuer address (must sign the tx).
  * @param params.credentialId 32-byte credential ID buffer.
+ * @param params.reason       Why the credential is revoked (#937).
  * @returns ScVal array ready for `contract.call('revoke_credential', ...)`.
  */
 export function buildRevokeCredentialArgs(params: {
   issuer: string;
   credentialId: Buffer;
+  reason: RevocationReason;
 }): xdr.ScVal[] {
   return [
     nativeToScVal(params.issuer, { type: 'address' }),
     nativeToScVal(params.credentialId, { type: 'bytes' }),
+    encodeRevocationReason(params.reason),
   ];
+}
+
+/**
+ * Build args for `revoke_credential_with_reason(issuer, credential_id, reason)`. #951
+ *
+ * @param params.reason Numeric `RevocationReason` value (encoded as `u32`).
+ */
+export function buildRevokeCredentialWithReasonArgs(params: {
+  issuer: string;
+  credentialId: Buffer;
+  reason: number;
+}): xdr.ScVal[] {
+  return [
+    nativeToScVal(params.issuer, { type: 'address' }),
+    nativeToScVal(params.credentialId, { type: 'bytes' }),
+    nativeToScVal(params.reason, { type: 'u32' }),
+  ];
+}
+
+/** Build args for `get_revocation_record(credential_id)`. #951 */
+export function buildGetRevocationRecordArgs(params: { credentialId: Buffer }): xdr.ScVal[] {
+  return [nativeToScVal(params.credentialId, { type: 'bytes' })];
+}
+
+/** Build args for `get_revoked_by_reason(reason)`. #951 */
+export function buildGetRevokedByReasonArgs(params: { reason: number }): xdr.ScVal[] {
+  return [nativeToScVal(params.reason, { type: 'u32' })];
 }
 
 /**
@@ -155,18 +221,19 @@ export function buildRevokeCredentialArgs(params: {
  *
  * @param params.issuer        Registered issuer address (must sign the tx).
  * @param params.credentialIds Array of 32-byte credential ID buffers to revoke.
- * @param params.reason        Short symbol string describing the revocation reason.
+ * @param params.reason        Why the credentials are revoked — the same enum the
+ *                             single-credential path takes since #937.
  * @returns ScVal array ready for `contract.call('revoke_credentials_batch', ...)`.
  */
 export function buildRevokeBatchArgs(params: {
   issuer: string;
   credentialIds: Buffer[];
-  reason: string;
+  reason: RevocationReason;
 }): xdr.ScVal[] {
   return [
     nativeToScVal(params.issuer, { type: 'address' }),
     xdr.ScVal.scvVec(params.credentialIds.map((id) => nativeToScVal(id, { type: 'bytes' }))),
-    nativeToScVal(params.reason, { type: 'symbol' }),
+    encodeRevocationReason(params.reason),
   ];
 }
 
@@ -182,12 +249,12 @@ export function buildRevokeBatchArgs(params: {
 export function buildRenewCredentialArgs(params: {
   issuer: string;
   credentialId: Buffer;
-  newExpiresAt: number;
+  newExpiresAt: number | bigint;
 }): xdr.ScVal[] {
   return [
     nativeToScVal(params.issuer, { type: 'address' }),
     nativeToScVal(params.credentialId, { type: 'bytes' }),
-    nativeToScVal(params.newExpiresAt, { type: 'u64' }),
+    encodeU64(params.newExpiresAt),
   ];
 }
 
@@ -339,6 +406,41 @@ export function buildGetRevocationsArgs(params: {
     nativeToScVal(params.issuer, { type: 'address' }),
     nativeToScVal(params.subject, { type: 'address' }),
   ];
+}
+
+/**
+ * Build args for `cancel_activation(issuer, credential_id)`. #731
+ *
+ * Cancels the pending time-locked activation for a credential before the
+ * `activation_time` has been reached. Only the original issuer may call this.
+ *
+ * @param params.issuer       Registered issuer address (must sign the tx).
+ * @param params.credentialId 32-byte credential ID buffer.
+ * @returns ScVal array ready for `contract.call('cancel_activation', ...)`.
+ */
+export function buildCancelActivationArgs(params: {
+  issuer: string;
+  credentialId: Buffer;
+}): xdr.ScVal[] {
+  return [
+    nativeToScVal(params.issuer, { type: 'address' }),
+    nativeToScVal(params.credentialId, { type: 'bytes' }),
+  ];
+}
+
+/**
+ * Build args for `get_pending_activations(subject)`. #731
+ *
+ * Returns credential IDs for time-locked credentials that have not yet reached
+ * their `activation_time` and have not been cancelled.
+ *
+ * @param params.subject Stellar address of the credential subject.
+ * @returns ScVal array ready for `contract.call('get_pending_activations', ...)`.
+ */
+export function buildGetPendingActivationsArgs(params: {
+  subject: string;
+}): xdr.ScVal[] {
+  return [nativeToScVal(params.subject, { type: 'address' })];
 }
 
 // ── reputation ───────────────────────────────────────────────────────────────

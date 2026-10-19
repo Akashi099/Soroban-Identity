@@ -7,6 +7,14 @@ import {
   nativeToScVal,
   scValToNative,
 } from "@stellar/stellar-sdk";
+import type {
+  Credential,
+  CredentialType,
+  RevocationReason,
+  SorobanIdentityConfig,
+  VerifyResult,
+} from "./types";
+import { REVOCATION_REASONS } from "./types";
 import { createHash } from "node:crypto";
 import type {
   CallOptions,
@@ -16,13 +24,16 @@ import type {
   CredentialType,
   Page,
   PaginationOptions,
+  RevocationReason,
   RevokedCredential,
+  RevocationRecord,
+  RevokeOptions,
   SorobanIdentityConfig,
   SorobanResponse,
   VerifyResult,
   WriteResult,
 } from "./types";
-import { validateConfig } from "./types";
+import { validateConfig, RevocationReason } from "./types";
 import { retryWithBackoff, validateStellarAddress, pollTransactionStatus, runConcurrent } from "./utils";
 import { ContractError, SorobanIdentityError, wrapError, ClaimsValidationError } from "./errors";
 import { CREDENTIAL_MANAGER_ERRORS } from "./error-codes";
@@ -30,6 +41,9 @@ import { BaseClient } from "./base-client";
 import {
   buildIssueCredentialArgs,
   buildRevokeCredentialArgs,
+  buildRevokeCredentialWithReasonArgs,
+  buildGetRevocationRecordArgs,
+  buildGetRevokedByReasonArgs,
   buildRevokeBatchArgs,
   buildRenewCredentialArgs,
   buildVerifyCredentialArgs,
@@ -42,6 +56,11 @@ import {
   buildGetIssuerCredentialsArgs,
   buildListIssuerCredentialsArgs,
   buildGetRevocationsArgs,
+  buildCancelActivationArgs,
+  buildGetPendingActivationsArgs,
+  buildGetMerkleRootArgs,
+  buildUpdateMerkleRootArgs,
+  buildVerifyMerkleProofArgs,
 } from "./contract-args";
 
 const PROBE_ADDRESS = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
@@ -71,6 +90,54 @@ export interface BatchResult {
 }
 
 /**
+ * A single sibling hash on the path from a leaf to the merkle root.
+ *
+ * `position` records whether the sibling sits to the `'left'` or `'right'`
+ * of the node being hashed at that level, which is required to reconstruct
+ * the parent deterministically.
+ */
+export interface MerkleProofNode {
+  /** Sibling hash as a 64-char lowercase hex string (32 bytes). */
+  hash: string;
+  /** Whether the sibling is the left or right child of the parent. */
+  position: "left" | "right";
+}
+
+/**
+ * A merkle inclusion proof for a single credential within a batch.
+ *
+ * The tree is a standard binary merkle tree over the batch's credential IDs:
+ * - **Leaf**: `SHA-256(0x00 || credentialIdBytes)` (32-byte credential ID).
+ * - **Internal node**: `SHA-256(0x01 || leftHash || rightHash)`.
+ * - **Odd level**: the final unpaired node is promoted unchanged to the next level.
+ *
+ * Domain-separation prefixes (`0x00` for leaves, `0x01` for internal nodes)
+ * prevent second-preimage attacks between leaf and internal hashes.
+ */
+export interface MerkleProof {
+  /** The credential ID this proof is for, as a 64-char hex string. */
+  credentialId: string;
+  /** Sibling hashes ordered from the leaf level up to the root. */
+  path: MerkleProofNode[];
+  /** The merkle root the proof resolves to, as a 64-char hex string. */
+  root: string;
+  /** Zero-based index of the credential within the batch. */
+  index: number;
+  /** Total number of credentials in the batch. */
+  leafCount: number;
+}
+
+/** A merkle tree built off-chain over a batch of credential IDs. */
+export interface MerkleTree {
+  /** The merkle root as a 64-char lowercase hex string. */
+  root: string;
+  /** Leaf hashes (hex) in batch order. */
+  leaves: string[];
+  /** All tree levels, `levels[0]` being the leaves and the last level the root. */
+  levels: string[][];
+}
+
+/**
  * Converts a JavaScript Date or millisecond timestamp to Unix seconds.
  */
 export function toCredentialExpiry(dateOrMs: Date | number): number {
@@ -78,10 +145,170 @@ export function toCredentialExpiry(dateOrMs: Date | number): number {
   return Math.floor(ms / 1000);
 }
 
+const MERKLE_LEAF_PREFIX = Buffer.from([0x00]);
+const MERKLE_NODE_PREFIX = Buffer.from([0x01]);
+
+function normalizeCredentialIdHex(credentialId: string): string {
+  const hex = credentialId.startsWith("0x") ? credentialId.slice(2) : credentialId;
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+    throw new SorobanIdentityError(
+      "InvalidCredentialId: credential ID must be a 64-character hex string (32 bytes)",
+      "VALIDATION_ERROR"
+    );
+  }
+  return hex.toLowerCase();
+}
+
+function hashMerkleLeaf(credentialIdHex: string): string {
+  const idBytes = Buffer.from(normalizeCredentialIdHex(credentialIdHex), "hex");
+  return createHash("sha256")
+    .update(Buffer.concat([MERKLE_LEAF_PREFIX, idBytes]))
+    .digest("hex");
+}
+
+function hashMerkleNode(leftHex: string, rightHex: string): string {
+  return createHash("sha256")
+    .update(
+      Buffer.concat([
+        MERKLE_NODE_PREFIX,
+        Buffer.from(leftHex, "hex"),
+        Buffer.from(rightHex, "hex"),
+      ])
+    )
+    .digest("hex");
+}
+
+/**
+ * Build a merkle tree off-chain over a batch of credential IDs.
+ *
+ * The tree uses SHA-256 with domain separation (see {@link MerkleProof}).
+ * When a level has an odd number of nodes the trailing node is promoted
+ * unchanged to the next level.
+ *
+ * @param credentialIds Hex-encoded 32-byte credential IDs (with or without `0x`).
+ * @returns The {@link MerkleTree} including the root and all levels.
+ * @throws {SorobanIdentityError} with code `VALIDATION_ERROR` if the batch is
+ *   empty or any ID is malformed.
+ */
+export function buildMerkleTree(credentialIds: string[]): MerkleTree {
+  if (!Array.isArray(credentialIds) || credentialIds.length === 0) {
+    throw new SorobanIdentityError(
+      "InvalidBatch: at least one credential ID is required to build a merkle tree",
+      "VALIDATION_ERROR"
+    );
+  }
+  const leaves = credentialIds.map(hashMerkleLeaf);
+  const levels: string[][] = [leaves];
+  let current = leaves;
+  while (current.length > 1) {
+    const next: string[] = [];
+    for (let i = 0; i < current.length; i += 2) {
+      if (i + 1 < current.length) {
+        next.push(hashMerkleNode(current[i]!, current[i + 1]!));
+      } else {
+        next.push(current[i]!);
+      }
+    }
+    levels.push(next);
+    current = next;
+  }
+  return { root: current[0]!, leaves, levels };
+}
+
+/**
+ * Generate a merkle inclusion proof for a single credential within a batch.
+ *
+ * The tree is built entirely off-chain; only the resulting root needs to be
+ * stored on-chain (see {@link CredentialClient.updateMerkleRoot}).
+ *
+ * @param credentialIds All credential IDs in the batch.
+ * @param credentialId  The credential to prove membership for.
+ * @returns The {@link MerkleProof} for `credentialId`.
+ * @throws {SorobanIdentityError} with code `VALIDATION_ERROR` if the batch is
+ *   empty, any ID is malformed, or `credentialId` is not part of the batch.
+ *
+ * @example
+ * ```ts
+ * const proof = generateMerkleProof(batchIds, batchIds[3]);
+ * const ok = verifyMerkleProof(proof, proof.root); // true
+ * ```
+ */
+export function generateMerkleProof(
+  credentialIds: string[],
+  credentialId: string
+): MerkleProof {
+  const target = normalizeCredentialIdHex(credentialId);
+  const normalized = credentialIds.map(normalizeCredentialIdHex);
+  const index = normalized.indexOf(target);
+  if (index === -1) {
+    throw new SorobanIdentityError(
+      `InvalidProof: credential ${credentialId} is not part of the batch`,
+      "VALIDATION_ERROR"
+    );
+  }
+
+  const tree = buildMerkleTree(normalized);
+  const path: MerkleProofNode[] = [];
+  let idx = index;
+  for (let level = 0; level < tree.levels.length - 1; level++) {
+    const nodes = tree.levels[level]!;
+    const isRightNode = idx % 2 === 1;
+    const siblingIdx = isRightNode ? idx - 1 : idx + 1;
+    if (siblingIdx < nodes.length) {
+      path.push({
+        hash: nodes[siblingIdx]!,
+        position: isRightNode ? "left" : "right",
+      });
+    }
+    idx = Math.floor(idx / 2);
+  }
+
+  return {
+    credentialId: target,
+    path,
+    root: tree.root,
+    index,
+    leafCount: normalized.length,
+  };
+}
+
+/**
+ * Verify a merkle inclusion proof client-side, without any network calls.
+ *
+ * Recomputes the root from the leaf hash of `proof.credentialId` and the
+ * sibling path, then compares it to `root`.
+ *
+ * @param proof The proof returned by {@link generateMerkleProof}.
+ * @param root  The expected merkle root (64-char hex). Defaults to `proof.root`
+ *              when omitted.
+ * @returns `true` when the proof resolves to `root`.
+ */
+export function verifyMerkleProof(proof: MerkleProof, root?: string): boolean {
+  if (!proof || !Array.isArray(proof.path)) return false;
+  let current: string;
+  try {
+    current = hashMerkleLeaf(proof.credentialId);
+  } catch {
+    return false;
+  }
+  for (const node of proof.path) {
+    if (!node || !/^[0-9a-fA-F]{64}$/.test(node.hash)) return false;
+    const sibling = node.hash.toLowerCase();
+    current =
+      node.position === "left"
+        ? hashMerkleNode(sibling, current)
+        : hashMerkleNode(current, sibling);
+  }
+  const expected = (root ?? proof.root).toLowerCase();
+  return current === expected;
+}
+
 /** Contract error codes returned by credential-manager — see {@link CREDENTIAL_MANAGER_ERRORS}. */
 const CREDENTIAL_NOT_FOUND_CODE = 3;
 const CREDENTIAL_REVOKED_CODE = 4;
 const CREDENTIAL_EXPIRED_CODE = 9;
+/** #731: credential has not yet reached its activation_time. */
+const CREDENTIAL_NOT_YET_ACTIVE_CODE = 22;
 
 /**
  * Client for the credential-manager contract.
@@ -310,12 +537,16 @@ export class CredentialClient extends BaseClient {
 
   /**
    * Revoke a credential that was issued by `issuerKeypair`.
+   *
+   * Pass `options.reason` to record a standardized {@link RevocationReason}
+   * on-chain (#951); without it the contract records `Unspecified`.
    */
   async revokeCredential(
     issuerKeypair: Keypair,
     credentialId: string,
-    options?: CallOptions
+    options?: RevokeOptions
   ): Promise<SorobanResponse<RevokedCredential>> {
+    const reason = options?.reason;
     const account = await this.server.getAccount(issuerKeypair.publicKey());
     const timeout = options?.timeoutSeconds ?? this.config.txTimeout ?? 30;
     const idBytes = Buffer.from(credentialId, 'hex');
@@ -325,10 +556,19 @@ export class CredentialClient extends BaseClient {
       networkPassphrase: this.config.networkPassphrase,
     })
       .addOperation(
-        this.contract.call(
-          'revoke_credential',
-          ...buildRevokeCredentialArgs({ issuer: issuerKeypair.publicKey(), credentialId: idBytes })
-        )
+        options?.reason === undefined
+          ? this.contract.call(
+              'revoke_credential',
+              ...buildRevokeCredentialArgs({ issuer: issuerKeypair.publicKey(), credentialId: idBytes })
+            )
+          : this.contract.call(
+              'revoke_credential_with_reason',
+              ...buildRevokeCredentialWithReasonArgs({
+                issuer: issuerKeypair.publicKey(),
+                credentialId: idBytes,
+                reason: reason!,
+              })
+            )
       )
       .setTimeout(timeout)
       .build();
@@ -350,7 +590,12 @@ export class CredentialClient extends BaseClient {
       const revokedAt = new Date((confirmed as { createdAt: number }).createdAt * 1000).toISOString();
 
       const credential = await this.getCredential(issuerKeypair.publicKey(), credentialId, options);
-      const revokedCredential: RevokedCredential = { ...credential, revokedAt, status: 'revoked' };
+      const revokedCredential: RevokedCredential = {
+        ...credential,
+        revokedAt,
+        status: 'revoked',
+        revocationReason: reason,
+      };
       return { data: revokedCredential, txHash };
     } catch (e) {
       throw wrapError(e);
@@ -434,7 +679,7 @@ export class CredentialClient extends BaseClient {
   async revokeBatch(
     issuerKeypair: Keypair,
     ids: string[],
-    reason: string,
+    reason: RevocationReason,
     options?: CallOptions
   ): Promise<{ txHash: string }> {
     if (ids.length > 50) {
@@ -483,6 +728,111 @@ export class CredentialClient extends BaseClient {
     }
   }
 
+  /**
+   * Cancel the pending time-locked activation for a credential. #731
+   *
+   * Only the original issuer may call this. The credential's `activation_time`
+   * must not yet have been reached. Once cancelled the credential is
+   * permanently inactive — it cannot be reactivated.
+   *
+   * @param issuerKeypair  Keypair of the registered issuer that issued the credential.
+   * @param credentialId   Hex-encoded credential ID (32 bytes).
+   * @param options        Per-call overrides.
+   * @returns `{ txHash }` — the on-chain transaction hash.
+   *
+   * @throws {SorobanIdentityError} with code `NOT_FOUND` if the credential does not exist,
+   *   `UNAUTHORIZED` if the caller is not the issuer,
+   *   `VALIDATION_ERROR` if the credential is revoked or already cancelled, or
+   *   `INVALID_ARGUMENT` if `activation_time` has already passed.
+   */
+  async cancelActivation(
+    issuerKeypair: Keypair,
+    credentialId: string,
+    options?: CallOptions
+  ): Promise<{ txHash: string }> {
+    const account = await this.server.getAccount(issuerKeypair.publicKey());
+    const timeout = options?.timeoutSeconds ?? this.config.txTimeout ?? 30;
+    const idBytes = Buffer.from(credentialId, 'hex');
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call(
+          'cancel_activation',
+          ...buildCancelActivationArgs({ issuer: issuerKeypair.publicKey(), credentialId: idBytes })
+        )
+      )
+      .setTimeout(timeout)
+      .build();
+
+    try {
+      const prepared = await retryWithBackoff(() => this.server.prepareTransaction(tx));
+      prepared.sign(issuerKeypair);
+
+      const result = await retryWithBackoff(() => this.server.sendTransaction(prepared));
+      this.debug('sdk.submission_outcome', { operation: 'credentials.cancelActivation', status: result.status });
+      if (result.status !== 'PENDING') {
+        throw new SorobanIdentityError(`Transaction failed: ${result.status}`, 'CONTRACT_ERROR');
+      }
+
+      const txHash = result.hash;
+      await pollTransactionStatus(this.server, txHash);
+      return { txHash };
+    } catch (e) {
+      throw wrapError(e);
+    }
+  }
+
+  /**
+   * Return the credential IDs of all pending time-locked credentials for a
+   * subject — those whose `activation_time` is set, still in the future, and
+   * not yet cancelled. #731
+   *
+   * This is a read-only simulation call and does not require signing.
+   */
+  async getPendingActivations(
+    callerAddress: string,
+    subjectAddress: string,
+    options?: CallOptions
+  ): Promise<string[]> {
+    validateStellarAddress(callerAddress);
+    validateStellarAddress(subjectAddress);
+    const account = new Account(callerAddress, '0');
+    const timeout = options?.timeoutSeconds ?? this.config.txTimeout ?? 30;
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call(
+          'get_pending_activations',
+          ...buildGetPendingActivationsArgs({ subject: subjectAddress })
+        )
+      )
+      .setTimeout(timeout)
+      .build();
+
+    const result = await retryWithBackoff(() => this.server.simulateTransaction(tx));
+    if (SorobanRpc.Api.isSimulationError(result)) {
+      const errMsg = (result as { error: string }).error ?? '';
+      const contractErr = ContractError.extract(errMsg, CREDENTIAL_MANAGER_ERRORS);
+      if (contractErr) throw contractErr;
+      throw new SorobanIdentityError(`Simulation failed: ${errMsg}`, 'CONTRACT_ERROR');
+    }
+
+    const retval = scValToNative(
+      (result as SorobanRpc.Api.SimulateTransactionSuccessResponse).result!.retval
+    );
+
+    if (!Array.isArray(retval)) return [];
+    return retval.map((raw: unknown) =>
+      Buffer.from(raw as Uint8Array).toString('hex')
+    );
+  }
+
   private async _validateClaimsAgainstSchema(
     schemaId: string,
     claims: Record<string, string>
@@ -529,6 +879,9 @@ export class CredentialClient extends BaseClient {
 
   /**
    * Verify a credential and get a typed result describing any failure reason.
+   *
+   * Issue #666: Add retry logic to handle state propagation delays when immediately
+   * verifying a freshly issued credential.
    */
   async verifyCredential(
     callerAddress: string,
@@ -553,45 +906,83 @@ export class CredentialClient extends BaseClient {
       .setTimeout(timeout)
       .build();
 
-    const result = await retryWithBackoff(() => this.server.simulateTransaction(tx));
-    const isSimulationError = SorobanRpc.Api.isSimulationError(result);
-    this.debug('sdk.simulation_result', { operation: 'credentials.simulateTransaction', success: !isSimulationError });
+    let lastError: { error: string } | null = null;
+    let retries = 3;
 
-    if (isSimulationError) {
-      const error: string = (result as { error: string }).error ?? "";
-      const contractErr = ContractError.extract(error, CREDENTIAL_MANAGER_ERRORS);
-      if (contractErr) {
-        if (contractErr.code === CREDENTIAL_NOT_FOUND_CODE) return { valid: false, reason: 'not_found' };
-        if (contractErr.code === CREDENTIAL_REVOKED_CODE) return { valid: false, reason: 'revoked' };
-        if (contractErr.code === CREDENTIAL_EXPIRED_CODE) return { valid: false, reason: 'expired' };
+    // Retry logic for handling state propagation delays
+    while (retries > 0) {
+      const result = await retryWithBackoff(() => this.server.simulateTransaction(tx));
+      const isSimulationError = SorobanRpc.Api.isSimulationError(result);
+      this.debug('sdk.simulation_result', { operation: 'credentials.simulateTransaction', success: !isSimulationError });
+
+      if (isSimulationError) {
+        const error: string = (result as { error: string }).error ?? "";
+        lastError = result as { error: string };
+        const contractErr = ContractError.extract(error, CREDENTIAL_MANAGER_ERRORS);
+
+        if (contractErr) {
+          // Don't retry on these errors - they're definitive
+          if (contractErr.code === CREDENTIAL_NOT_FOUND_CODE && retries > 1) {
+            // Issue #666: Retry if credential not found, as it might not be indexed yet
+            retries--;
+            await new Promise(r => setTimeout(r, 500));
+            continue;
+          }
+          if (contractErr.code === CREDENTIAL_REVOKED_CODE) return { valid: false, reason: 'revoked' };
+          if (contractErr.code === CREDENTIAL_EXPIRED_CODE) return { valid: false, reason: 'expired' };
+          if (contractErr.code === CREDENTIAL_NOT_FOUND_CODE) return { valid: false, reason: 'not_found' };
+          // #731: credential has not yet reached its activation_time
+          if (contractErr.code === CREDENTIAL_NOT_YET_ACTIVE_CODE) return { valid: false, reason: 'not_yet_active' };
+          return { valid: false, reason: 'unknown' };
+        }
+
+        const lowerError = error.toLowerCase();
+        if ((lowerError.includes('not found') || lowerError.includes('credentialnotfound')) && retries > 1) {
+          // Retry on not found errors due to state propagation delays
+          retries--;
+          await new Promise(r => setTimeout(r, 500));
+          continue;
+        }
+        if (lowerError.includes('not found') || lowerError.includes('credentialnotfound')) {
+          return { valid: false, reason: 'not_found' };
+        }
         return { valid: false, reason: 'unknown' };
       }
-      const lowerError = error.toLowerCase();
-      if (lowerError.includes('not found') || lowerError.includes('credentialnotfound')) {
+
+      const retval = scValToNative(
+        (result as SorobanRpc.Api.SimulateTransactionSuccessResponse).result!.retval
+      );
+
+      if (retval !== false) {
+        return { valid: true };
+      }
+
+      // Contract returned false — fetch the credential to determine why
+      try {
+        const credential = await this.getCredential(callerAddress, credentialId, options);
+        if (credential.revoked) return { valid: false, reason: 'revoked' };
+        if (credential.expiresAt > 0 && credential.expiresAt < Math.floor(Date.now() / 1000)) {
+          return { valid: false, reason: 'expired' };
+        }
+        return { valid: false, reason: 'unknown' };
+      } catch (e) {
+        if (retries > 1) {
+          retries--;
+          await new Promise(r => setTimeout(r, 500));
+          continue;
+        }
+        return { valid: false, reason: 'unknown' };
+      }
+    }
+
+    // If all retries exhausted, return the last error
+    if (lastError) {
+      const error = lastError.error;
+      if (error.toLowerCase().includes('not found') || error.toLowerCase().includes('credentialnotfound')) {
         return { valid: false, reason: 'not_found' };
       }
-      return { valid: false, reason: 'unknown' };
     }
-
-    const retval = scValToNative(
-      (result as SorobanRpc.Api.SimulateTransactionSuccessResponse).result!.retval
-    );
-
-    if (retval !== false) {
-      return { valid: true };
-    }
-
-    // Contract returned false — fetch the credential to determine why
-    try {
-      const credential = await this.getCredential(callerAddress, credentialId, options);
-      if (credential.revoked) return { valid: false, reason: 'revoked' };
-      if (credential.expiresAt > 0 && credential.expiresAt < Math.floor(Date.now() / 1000)) {
-        return { valid: false, reason: 'expired' };
-      }
-      return { valid: false, reason: 'unknown' };
-    } catch {
-      return { valid: false, reason: 'unknown' };
-    }
+    return { valid: false, reason: 'unknown' };
   }
 
   /**
@@ -610,14 +1001,18 @@ export class CredentialClient extends BaseClient {
       throw new SorobanIdentityError("credentialIds cannot exceed 50 items", "INVALID_INPUT");
     }
     const concurrency = options?.concurrency ?? 5;
-    return runConcurrent(credentialIds, concurrency, async (id) => {
-      try {
-        const result = await this.verifyCredential(callerAddress, id, options);
-        return { id, ...result };
-      } catch {
-        return { id, valid: false, reason: "unknown" };
-      }
-    });
+    return runConcurrent(
+      credentialIds,
+      async (id) => {
+        try {
+          const result = await this.verifyCredential(callerAddress, id, options);
+          return { id, ...result };
+        } catch {
+          return { id, valid: false, reason: "unknown" };
+        }
+      },
+      concurrency
+    );
   }
 
   /**
@@ -964,6 +1359,77 @@ export class CredentialClient extends BaseClient {
   }
 
   /**
+   * Get the on-chain revocation record (reason, revoker, timestamp) for a
+   * credential. Resolves to `null` when the credential has not been revoked. #951
+   */
+  async getRevocationRecord(
+    callerAddress: string,
+    credentialId: string,
+    options?: CallOptions
+  ): Promise<RevocationRecord | null> {
+    const raw = await this.simulateRead(
+      callerAddress,
+      'get_revocation_record',
+      buildGetRevocationRecordArgs({ credentialId: Buffer.from(credentialId, 'hex') }),
+      options
+    ) as { credential_id: Uint8Array; reason: number; revoked_by: string; revoked_at: bigint } | null;
+    if (!raw) return null;
+    return {
+      credentialId: Buffer.from(raw.credential_id).toString('hex'),
+      reason: Number(raw.reason) as RevocationReason,
+      revokedBy: raw.revoked_by,
+      revokedAt: Number(raw.revoked_at),
+    };
+  }
+
+  /**
+   * List the IDs of all credentials revoked for a given {@link RevocationReason}. #951
+   */
+  async getRevokedByReason(
+    callerAddress: string,
+    reason: RevocationReason,
+    options?: CallOptions
+  ): Promise<string[]> {
+    const ids = await this.simulateRead(
+      callerAddress,
+      'get_revoked_by_reason',
+      buildGetRevokedByReasonArgs({ reason }),
+      options
+    ) as Uint8Array[] | null;
+    return (ids ?? []).map((id) => Buffer.from(id).toString('hex'));
+  }
+
+  /** Simulate a read-only contract call and return the decoded return value. */
+  private async simulateRead(
+    callerAddress: string,
+    method: string,
+    args: unknown[],
+    options?: CallOptions
+  ): Promise<unknown> {
+    validateStellarAddress(callerAddress);
+    const account = new Account(callerAddress, "0");
+    const timeout = options?.timeoutSeconds ?? this.config.txTimeout ?? 30;
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(this.contract.call(method, ...(args as never[])))
+      .setTimeout(timeout)
+      .build();
+
+    const result = await retryWithBackoff(() => this.server.simulateTransaction(tx));
+    if (SorobanRpc.Api.isSimulationError(result)) {
+      const errMsg = result.error ?? '';
+      const contractErr = ContractError.extract(errMsg, CREDENTIAL_MANAGER_ERRORS);
+      if (contractErr) throw contractErr;
+      throw new SorobanIdentityError(`Simulation failed: ${errMsg}`, 'CONTRACT_ERROR');
+    }
+    return scValToNative(
+      (result as SorobanRpc.Api.SimulateTransactionSuccessResponse).result!.retval
+    );
+  }
+
+  /**
    * Get storage usage statistics for the credential manager.
    */
   async getStorageStats(callerAddress: string, options?: CallOptions): Promise<CredentialStorageStats> {
@@ -1243,6 +1709,110 @@ export class CredentialClient extends BaseClient {
     }
 
     return { succeeded, failed };
+  }
+
+  /**
+   * Read the on-chain merkle root stored for a credential batch. #1056
+   *
+   * @param callerAddress Any valid Stellar address used to build the read simulation.
+   * @param batchId       Identifier of the batch whose root to fetch.
+   * @param options       Per-call overrides.
+   * @returns The merkle root as a 64-char lowercase hex string, or `null` when
+   *   no root has been stored for the batch.
+   */
+  async getMerkleRoot(
+    callerAddress: string,
+    batchId: string,
+    options?: CallOptions
+  ): Promise<string | null> {
+    const raw = await this.simulateRead(
+      callerAddress,
+      'get_merkle_root',
+      buildGetMerkleRootArgs({ batchId }),
+      options
+    ) as Uint8Array | null;
+    if (!raw) return null;
+    return Buffer.from(raw).toString('hex');
+  }
+
+  /**
+   * Store or incrementally update the merkle root for a credential batch. #1056
+   *
+   * Only a registered issuer may call this. Passing a `proof` lets the contract
+   * verify the update against the previous root before persisting the new one,
+   * which keeps incremental updates cheap (O(log n) hashing on-chain).
+   *
+   * @param issuerKeypair The registered issuer signing the transaction.
+   * @param batchId       Identifier of the batch to update.
+   * @param newRoot       New merkle root as a 64-char hex string (32 bytes).
+   * @param options       Optional inclusion proof for the incremental update.
+   * @returns `{ txHash }` — the on-chain transaction hash.
+   */
+  async updateMerkleRoot(
+    issuerKeypair: Keypair,
+    batchId: string,
+    newRoot: string,
+    options?: CallOptions & { proof?: MerkleProof }
+  ): Promise<{ txHash: string }> {
+    const rootHex = normalizeCredentialIdHex(newRoot);
+    const account = await this.server.getAccount(issuerKeypair.publicKey());
+    const timeout = options?.timeoutSeconds ?? this.config.txTimeout ?? 30;
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call(
+          'update_merkle_root',
+          ...buildUpdateMerkleRootArgs({
+            issuer: issuerKeypair.publicKey(),
+            batchId,
+            newRoot: Buffer.from(rootHex, 'hex'),
+            proof: options?.proof,
+          })
+        )
+      )
+      .setTimeout(timeout)
+      .build();
+
+    try {
+      const prepared = await retryWithBackoff(() => this.server.prepareTransaction(tx));
+      prepared.sign(issuerKeypair);
+
+      const result = await retryWithBackoff(() => this.server.sendTransaction(prepared));
+      this.debug('sdk.submission_outcome', { operation: 'credentials.updateMerkleRoot', status: result.status });
+      if (result.status !== 'PENDING') {
+        throw new SorobanIdentityError(`Transaction failed: ${result.status}`, 'CONTRACT_ERROR');
+      }
+
+      const txHash = result.hash;
+      await pollTransactionStatus(this.server, txHash);
+      return { txHash };
+    } catch (e) {
+      throw wrapError(e);
+    }
+  }
+
+  /**
+   * Verify a merkle inclusion proof against the on-chain root for a batch. #1056
+   *
+   * This is a read-only simulation; the proof is checked by the contract so the
+   * caller does not need to trust a locally-cached root.
+   */
+  async verifyMerkleProofOnChain(
+    callerAddress: string,
+    batchId: string,
+    proof: MerkleProof,
+    options?: CallOptions
+  ): Promise<boolean> {
+    const result = await this.simulateRead(
+      callerAddress,
+      'verify_merkle_proof',
+      buildVerifyMerkleProofArgs({ batchId, proof }),
+      options
+    );
+    return result === true;
   }
 
   /**

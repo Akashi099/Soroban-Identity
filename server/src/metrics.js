@@ -30,6 +30,14 @@ const COUNTER_DEFINITIONS = {
   rpc_cache_hits_total: 'Total number of RPC cache hits',
   rpc_cache_misses_total: 'Total number of RPC cache misses',
   rpc_retries_total: 'Total number of RPC retries',
+  did_cache_hits_total: 'Total DID document cache hits',
+  did_cache_misses_total: 'Total DID document cache misses',
+  did_cache_sets_total: 'Total DID documents written to the cache',
+  did_cache_errors_total: 'Total DID cache operation failures',
+  did_cache_invalidations_total: 'Total DID cache invalidations',
+  query_cache_hits_total: 'Total query-result cache hits',
+  query_cache_misses_total: 'Total query-result cache misses',
+  query_cache_errors_total: 'Total query-result cache errors',
 };
 
 /**
@@ -47,22 +55,6 @@ function readCounter(counter) {
 }
 
 export class MetricsService {
-  constructor() {
-    this.counters = {
-      dids_created_total: 0,
-      credentials_issued_total: 0,
-      credentials_revoked_total: 0,
-      reputation_scores_submitted_total: 0,
-      rpc_cache_hits_total: 0,
-      rpc_cache_misses_total: 0,
-      did_cache_hits_total: 0,
-      did_cache_misses_total: 0,
-      did_cache_sets_total: 0,
-      did_cache_errors_total: 0,
-      did_cache_invalidations_total: 0,
-      rpc_retries_total: 0,
-    };
-    this.rpcLatencies = [];
   /**
    * @param {object} [options]
    * @param {boolean} [options.collectDefaultMetrics=true] - Register Node.js
@@ -135,6 +127,107 @@ export class MetricsService {
       registers: [this.registry],
     });
 
+    this.cspViolations = new client.Counter({
+      name: 'csp_violations_total',
+      help: 'Total number of Content Security Policy violation reports received, by directive',
+      labelNames: ['directive'],
+      registers: [this.registry],
+    });
+
+    this.batchOperations = new client.Counter({
+      name: 'batch_operations_total',
+      help: 'Total batch sub-operations processed via POST /batch, by operation type and result',
+      labelNames: ['type', 'result'],
+      registers: [this.registry],
+    });
+
+    this.batchRequests = new client.Counter({
+      name: 'batch_requests_total',
+      help: 'Total POST /batch requests, by atomic mode and whether the batch aborted early',
+      labelNames: ['atomic', 'aborted'],
+      registers: [this.registry],
+    });
+
+    this.quotaThresholdEvents = new client.Counter({
+      name: 'quota_threshold_events_total',
+      help: 'Total quota threshold crossings (80%/100% of a daily or monthly quota), by tier, period and threshold',
+      labelNames: ['tier', 'period', 'threshold'],
+      registers: [this.registry],
+    });
+
+    this.deprecatedEndpointUsage = new client.Counter({
+      name: 'deprecated_endpoint_usage_total',
+      help: 'Total requests to endpoints marked deprecated, by endpoint rule name',
+      labelNames: ['endpoint'],
+      registers: [this.registry],
+    });
+
+    this.ddosEvents = new client.Counter({
+      name: 'ddos_events_total',
+      help: 'Total DDoS protection events by type',
+      labelNames: ['type'],
+      registers: [this.registry],
+    });
+
+    this.nonceCollisions = new client.Counter({
+      name: 'nonce_collisions_total',
+      help: 'Total rejected requests carrying a duplicate (already-used) nonce, by route and key id',
+      labelNames: ['route', 'key_id'],
+      registers: [this.registry],
+    });
+    this.queryCacheLatency = new client.Histogram({
+      name: 'query_cache_lookup_latency_seconds',
+      help: 'Query-result cache lookup latency in seconds',
+      labelNames: ['outcome'],
+      buckets: [0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5],
+      registers: [this.registry],
+    });
+
+    this.rateLimitDecisions = new client.Counter({
+      name: 'rate_limit_decisions_total',
+      help: 'Rate limiter decisions by outcome (allowed, denied, bypass) and scope',
+      labelNames: ['outcome', 'scope'],
+      registers: [this.registry],
+    });
+
+    this.circuitBreakerState = new client.Gauge({
+      name: 'soroban_circuit_breaker_state',
+      help: 'Current state of the Soroban circuit breaker (0=CLOSED, 1=OPEN, 2=HALF_OPEN)',
+      registers: [this.registry],
+    });
+    this.circuitBreakerState.set(0);
+
+    this.circuitBreakerStateChanges = new client.Counter({
+      name: 'soroban_circuit_breaker_state_changes_total',
+      help: 'Total circuit breaker state changes by from and to state',
+      labelNames: ['from', 'to'],
+      registers: [this.registry],
+    });
+
+    this.circuitBreakerBreaks = new client.Counter({
+      name: 'soroban_circuit_breaker_breaks_total',
+      help: 'Total number of times the circuit breaker tripped OPEN',
+      registers: [this.registry],
+    });
+
+    this.circuitBreakerFailures = new client.Counter({
+      name: 'soroban_circuit_breaker_failures_total',
+      help: 'Total number of RPC failures recorded by circuit breaker',
+      registers: [this.registry],
+    });
+
+    this.circuitBreakerRejects = new client.Counter({
+      name: 'soroban_circuit_breaker_rejects_total',
+      help: 'Total number of RPC calls rejected fast by open circuit breaker',
+      registers: [this.registry],
+    });
+
+    this.circuitBreakerFallbacks = new client.Counter({
+      name: 'soroban_circuit_breaker_fallbacks_total',
+      help: 'Total number of fallback responses served by circuit breaker',
+      registers: [this.registry],
+    });
+
     if (collectDefaultMetrics) {
       client.collectDefaultMetrics({ register: this.registry });
     }
@@ -197,6 +290,107 @@ export class MetricsService {
    */
   observeCredentialVerification(result) {
     this.credentialsVerified.inc({ result: result ?? 'unknown' });
+  }
+
+  /**
+   * Record a CSP violation report.
+   *
+   * Labelled by directive so a dashboard shows *what* is being blocked: a
+   * spike in `script-src` is a possible injection, whereas a steady trickle
+   * from `img-src` is usually a policy that needs widening.
+   *
+   * @param {string} directive
+   */
+  observeCspViolation(directive) {
+    this.cspViolations.inc({ directive: directive || 'unknown' });
+  }
+
+  /**
+   * Record one batch sub-operation's outcome (#749).
+   * @param {object} sample
+   * @param {'issue'|'verify'|'revoke'} sample.type
+   * @param {'success'|'failed'} sample.result
+   */
+  observeBatchOperation({ type, result }) {
+    this.batchOperations.inc({ type: type || 'unknown', result: result || 'unknown' });
+  }
+
+  /**
+   * Record one completed POST /batch request (#749).
+   * @param {object} sample
+   * @param {boolean} sample.atomic
+   * @param {boolean} sample.aborted
+   */
+  observeBatchRequest({ atomic, aborted }) {
+    this.batchRequests.inc({ atomic: String(Boolean(atomic)), aborted: String(Boolean(aborted)) });
+  }
+
+  /**
+   * Record a quota threshold crossing (#748).
+   * @param {object} sample
+   * @param {string} sample.tier
+   * @param {'daily'|'monthly'} sample.period
+   * @param {number} sample.threshold - e.g. 0.8 or 1
+   */
+  observeQuotaThreshold({ tier, period, threshold }) {
+    this.quotaThresholdEvents.inc({ tier: tier || 'unknown', period: period || 'unknown', threshold: String(threshold) });
+  }
+
+  /**
+   * Record a request to a deprecated endpoint (#751).
+   * @param {string} endpoint - Deprecation rule name
+   */
+  observeDeprecatedEndpointUsage(endpoint) {
+    this.deprecatedEndpointUsage.inc({ endpoint: endpoint || 'unknown' });
+  }
+
+  observeQueryCache(outcome, durationSeconds = undefined) {
+    const name = outcome === 'hit' ? 'query_cache_hits_total' : outcome === 'miss' ? 'query_cache_misses_total' : 'query_cache_errors_total';
+    this._counters[name].inc();
+    if (durationSeconds !== undefined) this.queryCacheLatency.observe({ outcome: outcome || 'unknown' }, durationSeconds);
+  }
+
+  /**
+   * Record one rate limiter decision (#956).
+   * @param {{ outcome: string, scope: string }} decision
+   */
+  observeRateLimitDecision({ outcome, scope }) {
+    this.rateLimitDecisions.inc({ outcome: outcome || 'unknown', scope: scope || 'unknown' });
+  }
+
+  observeDdosEvent(type) { this.ddosEvents.inc({ type: type || 'unknown' }); }
+
+  /**
+   * Record a rejected request whose nonce had already been used (#1052).
+   *
+   * A sustained non-zero rate indicates either a replay attack or a client
+   * that is reusing nonces; alert on the rate rather than the raw counter.
+   *
+   * @param {object} [sample]
+   * @param {string} [sample.route]  - Normalized route pattern, not the raw path
+   * @param {string} [sample.keyId]  - API key / client identifier, when known
+   */
+  observeNonceCollision({ route, keyId } = {}) {
+    this.nonceCollisions.inc({ route: route || 'unknown', key_id: keyId || 'unknown' });
+  }
+
+  observeCircuitBreakerState(toState, fromState) {
+    const map = { CLOSED: 0, OPEN: 1, HALF_OPEN: 2 };
+    const num = map[String(toState).toUpperCase()] ?? 0;
+    this.circuitBreakerState.set(num);
+    if (fromState && toState) {
+      this.circuitBreakerStateChanges.inc({
+        from: String(fromState).toUpperCase(),
+        to: String(toState).toUpperCase(),
+      });
+    }
+  }
+
+  observeCircuitBreakerEvent(event) {
+    if (event === 'break') this.circuitBreakerBreaks.inc();
+    else if (event === 'failure') this.circuitBreakerFailures.inc();
+    else if (event === 'reject') this.circuitBreakerRejects.inc();
+    else if (event === 'fallback') this.circuitBreakerFallbacks.inc();
   }
 
   /**
@@ -273,38 +467,6 @@ export class MetricsService {
    * @returns {Promise<string>}
    */
   renderPrometheus() {
-    const lines = [];
-    for (const [name, value] of Object.entries(this.counters)) {
-      // Add HELP annotations for each counter
-      let helpText = '';
-      if (name === 'dids_created_total') helpText = 'Total number of DIDs created';
-      else if (name === 'credentials_issued_total') helpText = 'Total number of credentials issued';
-      else if (name === 'credentials_revoked_total') helpText = 'Total number of credentials revoked';
-      else if (name === 'reputation_scores_submitted_total') helpText = 'Total number of reputation scores submitted';
-      else if (name === 'did_cache_hits_total') helpText = 'Total DID document cache hits';
-      else if (name === 'did_cache_misses_total') helpText = 'Total DID document cache misses';
-      else if (name === 'did_cache_sets_total') helpText = 'Total DID documents written to the cache';
-      else if (name === 'did_cache_errors_total') helpText = 'Total DID cache operation failures';
-      else if (name === 'did_cache_invalidations_total') helpText = 'Total DID cache invalidations';
-      else if (name === 'rpc_cache_hits_total') helpText = 'Total number of RPC cache hits';
-      else if (name === 'rpc_cache_misses_total') helpText = 'Total number of RPC cache misses';
-      else if (name === 'rpc_retries_total') helpText = 'Total number of RPC retries';
-      
-      if (helpText) lines.push(`# HELP ${name} ${helpText}`);
-      lines.push(`# TYPE ${name} counter`, `${name} ${value}`);
-    }
-    
-    lines.push('# HELP soroban_rpc_call_latency_seconds Soroban RPC call latency in seconds');
-    lines.push('# TYPE soroban_rpc_call_latency_seconds histogram');
-    let cumulative = 0;
-    for (const bucket of HISTOGRAM_BUCKETS) {
-      cumulative = this.rpcLatencies.filter((value) => value <= bucket).length;
-      lines.push(`soroban_rpc_call_latency_seconds_bucket{le="${bucket}"} ${cumulative}`);
-    }
-    lines.push(`soroban_rpc_call_latency_seconds_bucket{le="+Inf"} ${this.rpcLatencies.length}`);
-    lines.push(`soroban_rpc_call_latency_seconds_sum ${this.rpcLatencies.reduce((sum, value) => sum + value, 0)}`);
-    lines.push(`soroban_rpc_call_latency_seconds_count ${this.rpcLatencies.length}`);
-    return `${lines.join('\n')}\n`;
     return this.registry.metrics();
   }
 

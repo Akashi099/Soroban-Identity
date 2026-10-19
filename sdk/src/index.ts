@@ -23,10 +23,39 @@ export type { ReputationRecord, ScoreHistoryEntry } from './reputation';
 //   4. Submit the fully-signed transaction:
 //        const { hash } = await client.submitSignedTransaction(signed2);
 export { BaseClient, getOrCreateServer, clearServerCache, SDK_VERSION } from './base-client';
-export type { AccountInfo } from './types';
+export type { AccountInfo, RevocationRecord } from './types';
 
 // ── Presentation ──────────────────────────────────────────────────────────────
 export { PresentationClient } from './presentation';
+
+// ── Merkle proofs (batch credential verification, closes #1056) ───────────────
+//
+// Merkle tree structure:
+//   - Leaves are credential IDs (or hashed credential payloads) ordered as
+//     inserted into the batch.
+//   - Each internal node is the hash of its two children; odd nodes are
+//     promoted unchanged to the next level.
+//   - The root is stored on-chain and used to verify inclusion proofs without
+//     revealing the full batch.
+//
+// Usage:
+//   const tree = buildMerkleTree(credentialIds);
+//   const proof = generateMerkleProof(tree, credentialId);
+//   const valid = verifyMerkleProof(proof, tree.root);
+export {
+  buildMerkleTree,
+  generateMerkleProof,
+  verifyMerkleProof,
+  updateMerkleTree,
+  hashLeaf,
+  hashNodes,
+} from './merkle';
+export type {
+  MerkleProof,
+  MerkleBatchRoot,
+  MerkleTree,
+  MerkleProofStep,
+} from './merkle';
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 export {
@@ -55,17 +84,43 @@ export {
   assertCredentialType,
   SimulationError,
   validateConfig,
+  RevocationReason,
 } from './types';
+export {
+  EXPORT_FORMATS,
+  EXPORT_MIME_TYPES,
+  EXPORT_SCHEMA_VERSION,
+  credentialStatus,
+  credentialToJson,
+  credentialToPdf,
+  credentialToXml,
+  escapeXml,
+  exportCredential,
+  exportLines,
+  toExportModel,
+} from './export';
+export type {
+  ExportedCredential,
+  ExportedFile,
+  ExportFormat,
+  CredentialStatus,
+} from './export';
 export type {
   DidDocument,
   ServiceEndpoint,
   Credential,
   RevokedCredential,
+  RevocationRecord,
+  RevokeOptions,
   CredentialType,
   CredentialListOptions,
   VerifyResult,
   VerifyFailReason,
   SorobanIdentityConfig,
+} from "./types";
+export { REVOCATION_REASONS } from "./types";
+export type { ReputationRecord, ScoreHistoryEntry } from "./reputation";
+export type {
   SorobanIdentityLogger,
   CallOptions,
   IdentityStorageStats,
@@ -135,6 +190,7 @@ export {
 
 // ── Contract arg builders ─────────────────────────────────────────────────────
 export {
+  encodeRevocationReason,
   buildCreateDidArgs,
   buildUpdateDidArgs,
   buildResolveDidArgs,
@@ -162,6 +218,11 @@ export {
   buildListReportersArgs,
   buildListHistoryArgs,
   buildGetRevocationsArgs,
+  buildCancelActivationArgs,
+  buildGetPendingActivationsArgs,
+  buildRevokeCredentialWithReasonArgs,
+  buildGetRevocationRecordArgs,
+  buildGetRevokedByReasonArgs,
 } from './contract-args';
 
 // ── OpenAPI / v1 ──────────────────────────────────────────────────────────────

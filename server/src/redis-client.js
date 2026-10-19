@@ -110,6 +110,8 @@ export class RedisClient {
     this.commandTimeoutMs = options.commandTimeoutMs ?? 1000;
     this.connectTimeoutMs = options.connectTimeoutMs ?? 2000;
     this.createConnection = options.createConnection ?? null;
+    this.enableAutoReconnect = options.enableAutoReconnect ?? true;
+    this.reconnectDelayMs = options.reconnectDelayMs ?? 1000;
 
     this.socket = null;
     this.connected = false;
@@ -118,6 +120,9 @@ export class RedisClient {
     this.buffer = Buffer.alloc(0);
     this.pending = [];
     this.attempts = 0;
+    this.reconnectAttempts = 0;
+    this.reconnecting = false;
+    this.reconnectTimer = null;
   }
 
   /**
@@ -219,8 +224,8 @@ export class RedisClient {
   }
 
   /**
-   * Fail every in-flight command when the socket drops, so no caller hangs
-   * waiting for a reply that will never arrive.
+   * Fail every in-flight command when the socket drops, then attempt to
+   * reconnect automatically with exponential backoff.
    */
   _onSocketFailure(error) {
     if (!this.connected && this.pending.length === 0) return;
@@ -233,6 +238,91 @@ export class RedisClient {
     for (const entry of pending) {
       clearTimeout(entry.timer);
       entry.reject(error);
+    }
+
+    // Attempt automatic reconnection if enabled and not manually closed
+    if (this.enableAutoReconnect && !this.closed && !this.reconnecting) {
+      this._scheduleReconnect();
+    }
+  }
+
+  /**
+   * Schedule an automatic reconnection attempt with exponential backoff.
+   */
+  _scheduleReconnect() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+    }
+
+    this.reconnecting = true;
+    this.reconnectAttempts += 1;
+
+    const delay = Math.min(
+      this.retryMaxMs,
+      this.reconnectDelayMs * 2 ** (this.reconnectAttempts - 1)
+    );
+
+    logger.info(
+      {
+        host: this.options.host,
+        port: this.options.port,
+        attempt: this.reconnectAttempts,
+        delayMs: delay,
+      },
+      'Scheduling Redis reconnection'
+    );
+
+    this.reconnectTimer = setTimeout(() => {
+      this._attemptReconnect();
+    }, delay);
+
+    if (typeof this.reconnectTimer.unref === 'function') {
+      this.reconnectTimer.unref();
+    }
+  }
+
+  /**
+   * Attempt to reconnect to Redis.
+   */
+  async _attemptReconnect() {
+    if (this.closed || this.connected) {
+      this.reconnecting = false;
+      return;
+    }
+
+    logger.info(
+      {
+        host: this.options.host,
+        port: this.options.port,
+        attempt: this.reconnectAttempts,
+      },
+      'Attempting Redis reconnection'
+    );
+
+    try {
+      await this.connect();
+      // Success! Reset reconnect counter
+      this.reconnectAttempts = 0;
+      this.reconnecting = false;
+      logger.info(
+        {
+          host: this.options.host,
+          port: this.options.port,
+        },
+        'Redis reconnection successful'
+      );
+    } catch (error) {
+      logger.warn(
+        {
+          host: this.options.host,
+          port: this.options.port,
+          attempt: this.reconnectAttempts,
+          error: error.message,
+        },
+        'Redis reconnection failed'
+      );
+      // Schedule next attempt
+      this._scheduleReconnect();
     }
   }
 
@@ -290,6 +380,27 @@ export class RedisClient {
     return this.command(args);
   }
 
+  /**
+   * Atomically set a key only if it does not already exist, with a TTL in
+   * milliseconds (`SET key value NX PX ttl`).
+   *
+   * Returns `true` when the key was claimed by this call, `false` when it was
+   * already present (or when the cache is unavailable). The non-fatal failure
+   * path is deliberate: an unreachable Redis must degrade to a cache miss
+   * rather than surfacing an error to the caller.
+   */
+  async setNx(key, value, ttlMs = null) {
+    const args = ['SET', key, value, 'NX'];
+    if (ttlMs && ttlMs > 0) args.push('PX', String(Math.floor(ttlMs)));
+    try {
+      const reply = await this.command(args);
+      return reply === 'OK';
+    } catch (error) {
+      logger.warn({ key, error: error.message }, 'Redis SET NX failed; treating as cache miss');
+      return false;
+    }
+  }
+
   async del(...keys) {
     if (keys.length === 0) return 0;
     return this.command(['DEL', ...keys]);
@@ -314,6 +425,14 @@ export class RedisClient {
 
   async quit() {
     this.closed = true;
+    this.reconnecting = false;
+    
+    // Cancel any pending reconnection attempt
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    
     if (this.connected && this.socket) {
       try {
         await this.command(['QUIT']);

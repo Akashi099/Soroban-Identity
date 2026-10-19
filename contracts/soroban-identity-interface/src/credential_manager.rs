@@ -1,8 +1,9 @@
 //! Stable trait ABI for the `credential-manager` contract.
 
 use credential_manager::{
-    Credential, CredentialIdsPage, CredentialManager, CredentialStorageStats, CredentialType,
-    ContractError, IssuersPage,
+    BatchVerifyResult, Credential, CredentialIdsPage, CredentialManager, CredentialStorageStats,
+    CredentialTypeDescriptor, CredentialType, ContractError, Escrow, EscrowConditions,
+    EscrowDeposit, EscrowStatus, IssuersPage, RevocationReason, RevocationRecord,
 };
 use soroban_sdk::{Address, Bytes, BytesN, Env, Map, String, Vec};
 
@@ -26,7 +27,12 @@ pub trait CredentialManagerInterface {
         new_admin: Address,
     ) -> Result<(), ContractError>;
 
-    fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), ContractError>;
+    fn upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+        timelock_duration: Option<u32>,
+    ) -> Result<(), ContractError>;
 
     fn add_issuer(env: Env, issuer: Address) -> Result<(), ContractError>;
 
@@ -48,14 +54,76 @@ pub trait CredentialManagerInterface {
         claims_hash: BytesN<32>,
         signature: Bytes,
         expires_at: u64,
+        activation_time: u64,
         schema_hash: Option<BytesN<32>>,
+        proof: Option<Bytes>,
     ) -> Result<BytesN<32>, ContractError>;
+
+    // ── Credential type registry (#656) ─────────────────────────────────────
+
+    fn compute_claims_schema_hash(env: Env, claims: Map<String, String>) -> BytesN<32>;
+
+    fn register_credential_type(
+        env: Env,
+        admin: Address,
+        type_name: String,
+        schema_hash: BytesN<32>,
+        metadata: Map<String, String>,
+    ) -> Result<(), ContractError>;
+
+    fn deactivate_credential_type(env: Env, admin: Address, type_name: String) -> Result<(), ContractError>;
+
+    fn get_credential_type(env: Env, type_name: String) -> Result<CredentialTypeDescriptor, ContractError>;
+
+    fn list_credential_types(env: Env) -> Vec<String>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn issue_typed_credential(
+        env: Env,
+        issuer: Address,
+        subject: Address,
+        type_name: String,
+        credential_type: CredentialType,
+        claims: Map<String, String>,
+        claims_hash: BytesN<32>,
+        signature: Bytes,
+        expires_at: u64,
+    ) -> Result<BytesN<32>, ContractError>;
+
+    // ── Credential delegation (#655) ────────────────────────────────────────
+
+    fn delegate_verification(
+        env: Env,
+        subject: Address,
+        delegate: Address,
+        credential_id: BytesN<32>,
+        expires_at: u64,
+    ) -> Result<(), ContractError>;
+
+    fn revoke_delegation(env: Env, subject: Address, delegate: Address) -> Result<(), ContractError>;
+
+    fn is_delegate_authorized(env: Env, subject: Address, delegate: Address, credential_id: BytesN<32>) -> bool;
+
+    fn verify_credential_as_delegate(
+        env: Env,
+        delegate: Address,
+        subject: Address,
+        credential_id: BytesN<32>,
+    ) -> Result<(), ContractError>;
 
     fn revoke_credential(
         env: Env,
         issuer: Address,
         credential_id: BytesN<32>,
+        reason: RevocationReason,
     ) -> Result<(), ContractError>;
+
+    /// The stored revocation record, or `CredentialNotFound` if the credential
+    /// was never revoked. #937
+    fn get_revocation(
+        env: Env,
+        credential_id: BytesN<32>,
+    ) -> Result<RevocationRecord, ContractError>;
 
     fn expire_credential(
         env: Env,
@@ -95,6 +163,72 @@ pub trait CredentialManagerInterface {
     ) -> CredentialIdsPage;
 
     fn get_storage_stats(env: Env) -> CredentialStorageStats;
+
+    /// Verify up to 50 credentials in one call (#819).
+    ///
+    /// `fail_fast` stops after the first invalid id and returns only the
+    /// results computed so far. Otherwise every id is reported.
+    fn verify_credentials_batch(
+        env: Env,
+        ids: Vec<BytesN<32>>,
+        fail_fast: bool,
+    ) -> Result<Vec<BatchVerifyResult>, ContractError>;
+
+    // ── Credential escrow (#1057) ───────────────────────────────────────────
+
+    /// Deposit a credential into escrow under the given release conditions.
+    fn escrow_deposit(
+        env: Env,
+        depositor: Address,
+        subject: Address,
+        credential_id: BytesN<32>,
+        conditions: EscrowConditions,
+    ) -> Result<BytesN<32>, ContractError>;
+
+    /// Verify whether the escrow's release conditions are currently met.
+    fn escrow_verify_conditions(env: Env, escrow_id: BytesN<32>) -> Result<bool, ContractError>;
+
+    /// Release an escrowed credential once its conditions are satisfied.
+    fn escrow_release(
+        env: Env,
+        caller: Address,
+        escrow_id: BytesN<32>,
+    ) -> Result<(), ContractError>;
+
+    /// Refund an escrow whose conditions failed or expired.
+    fn escrow_refund(
+        env: Env,
+        caller: Address,
+        escrow_id: BytesN<32>,
+    ) -> Result<(), ContractError>;
+
+    /// Raise a dispute on an active escrow.
+    fn escrow_dispute(
+        env: Env,
+        caller: Address,
+        escrow_id: BytesN<32>,
+        reason: String,
+    ) -> Result<(), ContractError>;
+
+    /// Resolve a disputed escrow, releasing or refunding it.
+    fn escrow_resolve_dispute(
+        env: Env,
+        admin: Address,
+        escrow_id: BytesN<32>,
+        release_to_subject: bool,
+    ) -> Result<(), ContractError>;
+
+    /// Query the full escrow record.
+    fn get_escrow(env: Env, escrow_id: BytesN<32>) -> Result<Escrow, ContractError>;
+
+    /// Query the lifecycle status of an escrow.
+    fn get_escrow_status(env: Env, escrow_id: BytesN<32>) -> Result<EscrowStatus, ContractError>;
+
+    /// List escrows created by a depositor.
+    fn list_depositor_escrows(env: Env, depositor: Address) -> Vec<BytesN<32>>;
+
+    /// List escrows targeting a subject.
+    fn list_subject_escrows(env: Env, subject: Address) -> Vec<BytesN<32>>;
 }
 
 /// Blanket implementation delegating to `CredentialManager`'s existing
@@ -121,8 +255,13 @@ impl CredentialManagerInterface for CredentialManager {
         Self::transfer_admin(env, current_admin, new_admin)
     }
 
-    fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), ContractError> {
-        Self::upgrade(env, admin, new_wasm_hash)
+    fn upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+        timelock_duration: Option<u32>,
+    ) -> Result<(), ContractError> {
+        Self::upgrade(env, admin, new_wasm_hash, timelock_duration)
     }
 
     fn add_issuer(env: Env, issuer: Address) -> Result<(), ContractError> {
@@ -150,7 +289,9 @@ impl CredentialManagerInterface for CredentialManager {
         claims_hash: BytesN<32>,
         signature: Bytes,
         expires_at: u64,
+        activation_time: u64,
         schema_hash: Option<BytesN<32>>,
+        proof: Option<Bytes>,
     ) -> Result<BytesN<32>, ContractError> {
         Self::issue_credential(
             env,
@@ -161,16 +302,95 @@ impl CredentialManagerInterface for CredentialManager {
             claims_hash,
             signature,
             expires_at,
+            activation_time,
             schema_hash,
+            proof,
         )
+    }
+
+    fn compute_claims_schema_hash(env: Env, claims: Map<String, String>) -> BytesN<32> {
+        Self::compute_claims_schema_hash(env, claims)
+    }
+
+    fn register_credential_type(
+        env: Env,
+        admin: Address,
+        type_name: String,
+        schema_hash: BytesN<32>,
+        metadata: Map<String, String>,
+    ) -> Result<(), ContractError> {
+        Self::register_credential_type(env, admin, type_name, schema_hash, metadata)
+    }
+
+    fn deactivate_credential_type(env: Env, admin: Address, type_name: String) -> Result<(), ContractError> {
+        Self::deactivate_credential_type(env, admin, type_name)
+    }
+
+    fn get_credential_type(env: Env, type_name: String) -> Result<CredentialTypeDescriptor, ContractError> {
+        Self::get_credential_type(env, type_name)
+    }
+
+    fn list_credential_types(env: Env) -> Vec<String> {
+        Self::list_credential_types(env)
+    }
+
+    fn issue_typed_credential(
+        env: Env,
+        issuer: Address,
+        subject: Address,
+        type_name: String,
+        credential_type: CredentialType,
+        claims: Map<String, String>,
+        claims_hash: BytesN<32>,
+        signature: Bytes,
+        expires_at: u64,
+    ) -> Result<BytesN<32>, ContractError> {
+        Self::issue_typed_credential(
+            env, issuer, subject, type_name, credential_type, claims, claims_hash, signature, expires_at,
+        )
+    }
+
+    fn delegate_verification(
+        env: Env,
+        subject: Address,
+        delegate: Address,
+        credential_id: BytesN<32>,
+        expires_at: u64,
+    ) -> Result<(), ContractError> {
+        Self::delegate_verification(env, subject, delegate, credential_id, expires_at)
+    }
+
+    fn revoke_delegation(env: Env, subject: Address, delegate: Address) -> Result<(), ContractError> {
+        Self::revoke_delegation(env, subject, delegate)
+    }
+
+    fn is_delegate_authorized(env: Env, subject: Address, delegate: Address, credential_id: BytesN<32>) -> bool {
+        Self::is_delegate_authorized(env, subject, delegate, credential_id)
+    }
+
+    fn verify_credential_as_delegate(
+        env: Env,
+        delegate: Address,
+        subject: Address,
+        credential_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        Self::verify_credential_as_delegate(env, delegate, subject, credential_id)
     }
 
     fn revoke_credential(
         env: Env,
         issuer: Address,
         credential_id: BytesN<32>,
+        reason: RevocationReason,
     ) -> Result<(), ContractError> {
-        Self::revoke_credential(env, issuer, credential_id)
+        Self::revoke_credential(env, issuer, credential_id, reason)
+    }
+
+    fn get_revocation(
+        env: Env,
+        credential_id: BytesN<32>,
+    ) -> Result<RevocationRecord, ContractError> {
+        Self::get_revocation(env, credential_id)
     }
 
     fn expire_credential(
@@ -234,5 +454,77 @@ impl CredentialManagerInterface for CredentialManager {
 
     fn get_storage_stats(env: Env) -> CredentialStorageStats {
         Self::get_storage_stats(env)
+    }
+
+    fn verify_credentials_batch(
+        env: Env,
+        ids: Vec<BytesN<32>>,
+        fail_fast: bool,
+    ) -> Result<Vec<BatchVerifyResult>, ContractError> {
+        Self::verify_credentials_batch(env, ids, fail_fast)
+    }
+
+    fn escrow_deposit(
+        env: Env,
+        depositor: Address,
+        subject: Address,
+        credential_id: BytesN<32>,
+        conditions: EscrowConditions,
+    ) -> Result<BytesN<32>, ContractError> {
+        Self::escrow_deposit(env, depositor, subject, credential_id, conditions)
+    }
+
+    fn escrow_verify_conditions(env: Env, escrow_id: BytesN<32>) -> Result<bool, ContractError> {
+        Self::escrow_verify_conditions(env, escrow_id)
+    }
+
+    fn escrow_release(
+        env: Env,
+        caller: Address,
+        escrow_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        Self::escrow_release(env, caller, escrow_id)
+    }
+
+    fn escrow_refund(
+        env: Env,
+        caller: Address,
+        escrow_id: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        Self::escrow_refund(env, caller, escrow_id)
+    }
+
+    fn escrow_dispute(
+        env: Env,
+        caller: Address,
+        escrow_id: BytesN<32>,
+        reason: String,
+    ) -> Result<(), ContractError> {
+        Self::escrow_dispute(env, caller, escrow_id, reason)
+    }
+
+    fn escrow_resolve_dispute(
+        env: Env,
+        admin: Address,
+        escrow_id: BytesN<32>,
+        release_to_subject: bool,
+    ) -> Result<(), ContractError> {
+        Self::escrow_resolve_dispute(env, admin, escrow_id, release_to_subject)
+    }
+
+    fn get_escrow(env: Env, escrow_id: BytesN<32>) -> Result<Escrow, ContractError> {
+        Self::get_escrow(env, escrow_id)
+    }
+
+    fn get_escrow_status(env: Env, escrow_id: BytesN<32>) -> Result<EscrowStatus, ContractError> {
+        Self::get_escrow_status(env, escrow_id)
+    }
+
+    fn list_depositor_escrows(env: Env, depositor: Address) -> Vec<BytesN<32>> {
+        Self::list_depositor_escrows(env, depositor)
+    }
+
+    fn list_subject_escrows(env: Env, subject: Address) -> Vec<BytesN<32>> {
+        Self::list_subject_escrows(env, subject)
     }
 }

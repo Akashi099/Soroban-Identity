@@ -72,6 +72,14 @@ export function assertCredentialType(value: unknown): CredentialType {
  * On-chain credential record returned by
  * {@link CredentialClient.getCredential}.
  */
+export interface CredentialVersionEntry {
+  version: number;
+  amendedAt: number;
+  amendedBy: string;
+  reason: string;
+  changeSummary: string;
+}
+
 export interface Credential {
   id: string; // hex-encoded 32-byte hash
   subject: string;
@@ -82,8 +90,22 @@ export interface Credential {
   claimsHash: string;
   signature: string; // hex
   issuedAt: number;
+  version: number;
+  lastModifiedAt: number;
+  versionHistory?: CredentialVersionEntry[];
+  /**
+   * Unix timestamp (seconds) before which this credential is inactive.
+   * `0` means the credential is active immediately (no time-lock). #731
+   */
+  activationTime: number;
   expiresAt: number; // 0 = no expiry
   revoked: boolean;
+  /**
+   * `true` when the issuer has cancelled a pending time-locked activation
+   * before the `activationTime` was reached. A cancelled credential is
+   * permanently inactive. #731
+   */
+  activationCancelled: boolean;
 }
 
 /**
@@ -95,10 +117,96 @@ export interface Credential {
  * discriminant `status` field so callers can narrow the type without
  * inspecting `revoked`.
  */
+
+/**
+ * Reasons a credential can be revoked with. Mirrors the contract's
+ * `RevocationReason` enum (#937).
+ *
+ * The values are the contract's variant names and are part of the wire format:
+ * never rename or reorder them. Use {@link normalizeRevocationReason} for values
+ * that come from user input (CSV imports, CLI flags) — it also accepts the
+ * snake_case labels the contract stores (`admin_revoked`).
+ */
+export const RevocationReason = {
+  Compromised: "Compromised",
+  Expired: "Expired",
+  Superseded: "Superseded",
+  Lost: "Lost",
+  AdminRevoked: "AdminRevoked",
+} as const;
+
+export type RevocationReason = (typeof RevocationReason)[keyof typeof RevocationReason];
+
+/** Every reason, in the contract's declaration order — use this for pickers. */
+export const REVOCATION_REASONS: readonly RevocationReason[] = [
+  RevocationReason.Compromised,
+  RevocationReason.Expired,
+  RevocationReason.Superseded,
+  RevocationReason.Lost,
+  RevocationReason.AdminRevoked,
+];
+
+/** Human-readable labels, keyed by reason. */
+export const REVOCATION_REASON_LABELS: Record<RevocationReason, string> = {
+  [RevocationReason.Compromised]: "Compromised",
+  [RevocationReason.Expired]: "Expired",
+  [RevocationReason.Superseded]: "Superseded",
+  [RevocationReason.Lost]: "Lost",
+  [RevocationReason.AdminRevoked]: "Admin revoked",
+};
+
+/** True when `value` is already a {@link RevocationReason}. */
+export function isRevocationReason(value: unknown): value is RevocationReason {
+  return typeof value === "string" && (REVOCATION_REASONS as readonly string[]).includes(value);
+}
+
+/**
+ * Map user input to a {@link RevocationReason}.
+ *
+ * Accepts the exact enum value (`Superseded`), the contract's stored label
+ * (`superseded`), spaces or dashes instead of underscores (`admin revoked`)
+ * and any casing of those. Returns `undefined` for anything else, so callers
+ * can report the offending value instead of revoking for the wrong reason.
+ */
+export function normalizeRevocationReason(value: unknown): RevocationReason | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (isRevocationReason(value)) return value;
+  if (typeof value !== "string") return undefined;
+
+  const compact = value.trim().toLowerCase().replace(/[\s_-]+/g, "");
+  if (compact.length === 0) return undefined;
+  return REVOCATION_REASONS.find(
+    (reason) => reason.toLowerCase().replace(/[\s_-]+/g, "") === compact
+  );
+}
+
+/**
+ * A revocation record as stored by the contract (read back with
+ * `get_revocation`, #937).
+ */
+export interface RevocationRecord {
+  credentialId: string;
+  issuer: string;
+  subject: string;
+  reason: RevocationReason;
+  /** Unix timestamp (seconds) of the ledger that recorded the revocation. */
+  revokedAt: number;
+  /** Address that submitted the revocation, when the contract returns it. */
+  revokedBy?: string;
+}
+
 export interface RevokedCredential extends Credential {
   /** ISO-8601 timestamp of the ledger that included the revocation transaction. */
   revokedAt: string;
   status: 'revoked';
+  /** Standardized reason recorded on-chain for the revocation. #951 */
+  revocationReason?: RevocationReason;
+}
+
+/** Options for {@link CredentialClient.revokeCredential}. */
+export interface RevokeOptions extends CallOptions {
+  /** Standardized revocation reason. Omit to revoke without a reason code. */
+  reason?: RevocationReason;
 }
 
 /**
@@ -110,11 +218,13 @@ export interface RevokedCredential extends Credential {
  * - `UNKNOWN_ISSUER` — no credential was found for the given ID, or the
  *   credential's issuer is no longer registered.
  * - `INACTIVE_SUBJECT` — the subject's DID has been deactivated.
+ * - `not_yet_active` — the credential's `activationTime` has not been reached yet. #731
  */
 export type VerifyFailReason =
   | 'not_found'
   | 'revoked'
   | 'expired'
+  | 'not_yet_active'
   | 'unknown'
   | 'EXPIRED'
   | 'REVOKED'
@@ -335,10 +445,14 @@ export function validateConfig(
 export interface FeeEstimate {
   /** Base network fee in stroops. */
   baseFee: number;
-  /** Soroban resource fee in stroops. */
+  /** Soroban resource fee in stroops (after applying gas multiplier). */
   resourceFee: number;
   /** Total fee (baseFee + resourceFee) in stroops. */
   totalFee: number;
+  /** Gas multiplier applied to the resource fee (1.0 = no adjustment, 1.5 = 50% increase). */
+  gasMultiplier?: number;
+  /** Original resource fee before multiplier was applied (in stroops). */
+  originalResourceFee?: number;
 }
 
 export class SimulationError extends Error {
@@ -365,4 +479,152 @@ export interface AccountInfo {
    * and cache it for offline transaction assembly.
    */
   sequence: string;
+}
+
+/**
+ * Merkle tree structure used for batch credential verification (#1056).
+ *
+ * ## Tree layout
+ *
+ * Credential leaves are hashed with SHA-256 and inserted in the order they are
+ * supplied to {@link MerkleTree}. The tree is built as a binary tree where:
+ *
+ * - Each **leaf** is `SHA-256(0x00 || credentialId)` — the `0x00` domain
+ *   separator prevents second-preimage attacks where an internal node could be
+ *   reinterpreted as a leaf.
+ * - Each **internal node** is `SHA-256(0x01 || left || right)` — the `0x01`
+ *   domain separator distinguishes internal nodes from leaves.
+ * - When a level has an odd number of nodes, the last node is **duplicated**
+ *   (paired with itself) before hashing, so every level has an even count.
+ * - The **root** is the single node remaining at the top of the tree. An empty
+ *   batch has a root of 32 zero bytes.
+ *
+ * ## Proofs
+ *
+ * A {@link MerkleProof} contains the sibling hashes on the path from the leaf
+ * to the root, ordered from the bottom (closest to the leaf) upwards. Each
+ * sibling carries a {@link MerkleProofSibling.index} that records the node's
+ * position within its level; the verifier uses this to decide whether the
+ * sibling is concatenated on the left or the right of the running hash.
+ *
+ * ## Incremental updates
+ *
+ * Appending a leaf to a batch updates only the rightmost path of the tree, so
+ * the root can be recomputed in `O(log n)` hashes. The on-chain root is
+ * replaced by submitting the new root with {@link MerkleBatchRoot.leafCount}
+ * incremented; see {@link SubmitMerkleRootOptions}.
+ */
+
+/**
+ * One sibling hash on the path from a credential leaf to the merkle root.
+ *
+ * `index` is the position of this node within its tree level. When
+ * `index % 2 === 0` the sibling sits to the **left** of the running hash and is
+ * concatenated first; when odd it sits to the **right**. `siblingOnLeft` is the
+ * pre-computed boolean form of that check, provided so callers that serialise
+ * proofs (e.g. to pass them to the contract) do not have to re-derive it.
+ */
+export interface MerkleProofSibling {
+  /** Hex-encoded 32-byte sibling hash. */
+  hash: string;
+  /** Zero-based position of this node within its tree level. */
+  index: number;
+  /** `true` when this sibling is concatenated to the left of the running hash. */
+  siblingOnLeft: boolean;
+}
+
+/**
+ * Merkle inclusion proof for a single credential in a batch (#1056).
+ *
+ * Produced by {@link generateMerkleProof} and consumed by
+ * {@link verifyMerkleProof}. The proof is self-contained: given the leaf hash,
+ * the siblings and the expected root, verification requires no tree state.
+ */
+export interface MerkleProof {
+  /** Hex-encoded 32-byte hash of the credential leaf being proven. */
+  leaf: string;
+  /**
+   * Sibling hashes from the leaf level upwards. The first entry is the sibling
+   * of the leaf itself; the last entry is the sibling of the child of the root.
+   */
+  siblings: MerkleProofSibling[];
+  /** Zero-based index of the leaf within the batch. */
+  leafIndex: number;
+  /** Total number of leaves in the batch the proof was generated from. */
+  leafCount: number;
+  /** Hex-encoded 32-byte merkle root the proof resolves to. */
+  root: string;
+}
+
+/**
+ * On-chain merkle root for a batch of credentials (#1056).
+ *
+ * Stored by the credential-manager contract so a verifier only needs the root
+ * (32 bytes) plus a proof (`O(log n)` hashes) instead of every credential in
+ * the batch. This keeps verification gas cost logarithmic in the batch size.
+ */
+export interface MerkleBatchRoot {
+  /** Identifier of the batch this root commits to. */
+  batchId: string;
+  /** Hex-encoded 32-byte merkle root. */
+  root: string;
+  /** Number of credential leaves committed to by `root`. */
+  leafCount: number;
+  /** Unix timestamp (seconds) when the root was last updated on-chain. */
+  updatedAt: number;
+}
+
+/**
+ * Options for {@link generateMerkleProof} / {@link generateMerkleProofs}.
+ */
+export interface MerkleProofOptions {
+  /**
+   * Hash function used to build the tree. Defaults to `"sha256"`, the only
+   * algorithm supported by the on-chain verifier.
+   */
+  algorithm?: "sha256";
+  /**
+   * When `true`, proofs are generated for every leaf in the batch rather than
+   * a single leaf. Used by {@link generateMerkleProofs}.
+   */
+  allLeaves?: boolean;
+}
+
+/**
+ * Options for submitting a merkle root to the credential-manager contract.
+ *
+ * Extends {@link CallOptions} so callers can override the transaction timeout
+ * for large batches.
+ */
+export interface SubmitMerkleRootOptions extends CallOptions {
+  /**
+   * Batch identifier to associate with the root. When omitted the contract
+   * derives one from the issuer address and the current ledger sequence.
+   */
+  batchId?: string;
+  /**
+   * When `true`, the contract treats the submission as an incremental update:
+   * the existing root for `batchId` is replaced and `leafCount` is expected to
+   * be greater than the stored value. Defaults to `false` (full replacement).
+   */
+  incremental?: boolean;
+  /**
+   * Expected leaf count after the update. The contract rejects the submission
+   * when this does not match the recomputed tree size, guarding against
+   * truncated batches.
+   */
+  expectedLeafCount?: number;
+}
+
+/**
+ * Options for verifying a merkle proof against an on-chain root.
+ */
+export interface VerifyMerkleProofOptions extends CallOptions {
+  /**
+   * Expected merkle root. When omitted the SDK fetches the stored root for
+   * {@link MerkleBatchRoot.batchId} from the contract before verifying.
+   */
+  root?: string;
+  /** Batch identifier whose stored root should be used when `root` is omitted. */
+  batchId?: string;
 }

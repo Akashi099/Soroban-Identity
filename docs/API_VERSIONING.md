@@ -38,6 +38,30 @@ Requests to unversioned endpoints (e.g. `/credentials`, `/health`, `/info`) defa
 
 ---
 
+## Route Structure
+
+Version-specific route helpers live under `server/src/routes/`:
+
+| File | Purpose |
+| :--- | :--- |
+| `server/src/routes/version-middleware.js` | `applyVersioning(req, res, url)` – resolves version, sets headers, attaches `req.apiVersion` |
+| `server/src/routes/v1.js` | v1 route map, `withV1Prefix`, `stripV1Prefix`, pass-through `wrapResponse` |
+| `server/src/routes/v2.js` | v2 route map, `withV2Prefix`, v2 envelope `wrapResponse` / `toV2` |
+
+### Using the middleware in a route handler
+
+```js
+import { applyVersioning } from "./routes/version-middleware.js";
+import { toV2 } from "./routes/v2.js";
+
+// Inside the request handler:
+const { version, normalizedPath } = applyVersioning(req, res, url);
+const payload = { items: [...], nextCursor: null };
+return sendJson(res, 200, version === "v2" ? toV2(payload) : payload);
+```
+
+---
+
 ## 2. Supported Versions
 
 | Version | Status | Release Date | Deprecation Date | Sunset Date |
@@ -114,3 +138,54 @@ To provide stability for enterprise integrators, the API follows a strict deprec
      - `X-API-Version: <version>`
 3. **Sunset / Retirement:**
    - Following the sunset date, requests to retired versions will return `HTTP 410 Gone` with migration guidelines.
+
+---
+
+## 5. Per-Endpoint Deprecation (#751)
+
+Section 4 covers deprecating an entire API *version*. An individual *endpoint*
+can also be deprecated independently — e.g. a legacy alias that's superseded
+by a more explicit route, without deprecating the version it lives in.
+
+### How it works
+
+`server/src/deprecation.js` maintains a registry of deprecated endpoints,
+each entry naming the method, path pattern, deprecation date, sunset date,
+and a migration guide link. Every request is checked against this registry
+before routing; a match gets the same header treatment as a deprecated
+version:
+
+```http
+Deprecation: true
+Sunset: <RFC-3339 timestamp>
+Link: <migration guide URL>; rel="deprecation"
+X-Deprecated-Since: <date the endpoint was deprecated>
+X-Deprecated-Endpoint: <internal rule name>
+```
+
+Usage of a deprecated endpoint is also:
+- **Logged** — a `warn`-level log line per request, and a Prometheus counter
+  (`deprecated_endpoint_usage_total`, labelled by rule name) for dashboards.
+- **Notified** — the first time an authenticated API key hits a deprecated
+  endpoint on a given day, its owner is emailed a summary (endpoint, dates,
+  migration link). At most one email per key per endpoint per day.
+
+### Currently deprecated
+
+| Endpoint | Deprecated since | Sunset | Replacement |
+| :--- | :--- | :--- | :--- |
+| `DELETE /credentials/:id` | 2026-08-27 | 2027-02-27 | `POST /credentials/:id/revoke` (or `DELETE /credentials/:id/revoke`) |
+
+The bare `DELETE /credentials/:id` form is functionally identical to the
+`/revoke` endpoints — see the revoke handler in `server/src/app.js` — but its
+path doesn't name the action, and reads as a generic "delete this resource"
+call that credential revocation isn't. The `/revoke` suffix forms are not
+deprecated and remain the supported way to revoke a credential.
+
+### Timeline policy
+
+Per-endpoint deprecations follow the same **minimum 6-month** grace period
+as version-level deprecations (Section 4): a deprecated endpoint keeps
+working, with warning headers, for at least 6 months before its sunset date.
+After sunset, the endpoint is removed from the registry along with the route
+handler itself, at which point it returns `404`.
