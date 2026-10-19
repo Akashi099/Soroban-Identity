@@ -24,6 +24,7 @@ import { handleError } from "../utils/handleError";
 import { useWalletContext } from "../context/WalletContext";
 import { useToast } from "../context/ToastContext";
 import TemplateSelector from "../templates/TemplateSelector";
+import BrowserExtensionBanner from "./BrowserExtensionBanner";
 import { type CredentialTemplate, validateClaimsAgainstTemplate } from "../templates/credentialTemplates";
 import { exportCredentialsAsCSV, downloadExport } from "../utils/exportCredentials";
 import {
@@ -992,6 +993,7 @@ export default function CredentialsPanel({ verifyId }: { verifyId?: string | nul
 
   return (
     <>
+      <BrowserExtensionBanner credentials={displayCredentials} />
       {/* Filter bar */}
       <div className="card">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>

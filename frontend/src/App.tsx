@@ -15,7 +15,7 @@ const IdentityPanel = lazy(() => import("./components/IdentityPanel"));
 const CredentialsPanel = lazy(() => import("./components/CredentialsPanel"));
 const IssuerDashboard = lazy(() => import("./pages/IssuerDashboard"));
 const CredentialRecipientVerify = lazy(() => import("./components/CredentialRecipientVerify"));
-const NetworkStatistics = lazy(() => import("./pages/NetworkStatistics"));
+const NetworkStatistics = lazy(() => import("./components/NetworkStatistics"));
 
 const preloadCredentialsPanel = () => {
   void import("./components/CredentialsPanel");
@@ -24,7 +24,7 @@ const preloadCredentialRecipientVerify = () => {
   void import("./components/CredentialRecipientVerify");
 };
 const preloadNetworkStatistics = () => {
-  void import("./pages/NetworkStatistics");
+  void import("./components/NetworkStatistics");
 };
 import WalletButton from "./components/WalletButton";
 import ErrorBoundary from "./components/ErrorBoundary";
@@ -446,6 +446,7 @@ function AppContent() {
               </span>
             </span>
           )}
+          <VoiceCommandButton voice={voice} />
           <WalletButton wallet={wallet} />
         </div>
         <div
@@ -657,6 +658,15 @@ function AppContent() {
             hidden={tab !== Tab.IssuerAnalytics}
           >
             {tab === Tab.IssuerAnalytics && <IssuerDashboard />}
+          </div>
+          <div
+            id={`panel-${Tab.NetworkStatistics}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${Tab.NetworkStatistics}`}
+            data-tour="panel-network"
+            hidden={tab !== Tab.NetworkStatistics}
+          >
+            {tab === Tab.NetworkStatistics && <NetworkStatistics />}
           </div>
           </ViewTransition>
           </Suspense>
