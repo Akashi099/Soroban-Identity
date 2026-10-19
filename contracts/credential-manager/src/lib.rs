@@ -67,6 +67,10 @@ pub enum ContractError {
     BatchTooLarge = 17,
     InvalidSchemaHash = 18,
     ContractPaused = 19,
+    InvalidInput = 21,
+    NotFound = 22,
+    NotWhitelisted = 23,
+    RefundWindowClosed = 24,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -155,6 +159,11 @@ impl<'a> Drop for ReentrancyGuard<'a> {
 
 #[contract]
 pub struct CredentialManager;
+
+mod crl;
+mod encryption;
+mod external_verify;
+mod pricing;
 
 #[contractimpl]
 impl CredentialManager {
