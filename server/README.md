@@ -23,6 +23,8 @@ The server configuration can be customized using the following environment varia
 | `PORT` | HTTP port the server listens on. | `3001` |
 | `LOG_LEVEL` | Logging verbosity (trace, debug, info, warn, error, fatal). All logs are structured JSON. | `info` |
 | `ADMIN_API_KEY` | Key for authenticating request calls on `/admin/*` endpoints. Supports scoped access (see API Key Scopes below). | unset |
+| `ADMIN_IP_ALLOWLIST` | Comma-separated IPv4/IPv6 addresses or CIDR ranges permitted to reach admin endpoints. | unset |
+| `ADMIN_IP_ALLOWLIST_REQUIRED` | Fail closed when the allowlist is empty. Defaults to `true` in production and `false` elsewhere. | environment-dependent |
 | `DATA_DIR` | Directory path for local file storage. | `./data` |
 | `AUDIT_LOG_PATH` | Base file path prefix used for daily rotated audit logs. | `[DATA_DIR]/audit` |
 | `AUDIT_LOG_RETENTION_DAYS` | Number of days to retain rotated audit logs. | `30` |
@@ -37,6 +39,13 @@ The server configuration can be customized using the following environment varia
 | `RATE_LIMIT_PREMIUM_TIERS` | Tiers that bypass all rate limits. | `premium,enterprise` |
 | `RATE_LIMIT_PREMIUM_KEYS` | Comma-separated API key ids that bypass all rate limits. | unset |
 | `TRUST_PROXY` | Trust `X-Forwarded-For` when resolving the client IP. | `false` |
+
+Admin requests are checked against `ADMIN_IP_ALLOWLIST` before API key or OAuth
+authentication. For example, `ADMIN_IP_ALLOWLIST=203.0.113.8,198.51.100.0/24,2001:db8::/32`
+allows one IPv4 address, an IPv4 subnet and an IPv6 subnet. In production, an
+empty list returns `503` and disables admin access until a range is configured.
+When `TRUST_PROXY=true`, the first `X-Forwarded-For` address is used; only enable
+this when direct access to the server is restricted to the trusted proxy.
 
 ## Container image and health checks
 
