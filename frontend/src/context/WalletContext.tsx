@@ -3,6 +3,7 @@ import { useWallet } from "../hooks/useWallet";
 import type { WalletState, WalletConnectionError } from "../hooks/useWalletState";
 import type { FrontendNetworkConfig } from "../network";
 import { getNetworkConfig } from "../network";
+import { useIdleSessionTimeout } from "../hooks/useIdleSessionTimeout";
 
 interface WalletContextValue extends WalletState {
   connect: (walletType?: string) => void;
@@ -19,6 +20,7 @@ export const WalletContext = createContext<WalletContextValue | null>(null);
 export function WalletProvider({ children }: { children: ReactNode }) {
   const networkConfig: FrontendNetworkConfig = getNetworkConfig();
   const wallet = useWallet(networkConfig);
+  useIdleSessionTimeout(wallet.connected, wallet.disconnect);
 
   const value = useMemo(
     () => wallet,
@@ -42,14 +44,11 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     ]
   );
 
-  return (
-    <WalletContext.Provider value={value}>{children}</WalletContext.Provider>
-  );
+  return <WalletContext.Provider value={value}>{children}</WalletContext.Provider>;
 }
 
 export function useWalletContext(): WalletContextValue {
   const ctx = useContext(WalletContext);
-  if (!ctx)
-    throw new Error("useWalletContext must be used inside WalletProvider");
+  if (!ctx) throw new Error("useWalletContext must be used inside WalletProvider");
   return ctx;
 }

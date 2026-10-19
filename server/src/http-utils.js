@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { logger } from './logger.js';
+import { getClientAddress, isAdminIpAllowed } from './ip-whitelist.js';
 
 /**
  * Constant-time string comparison using crypto.timingSafeEqual.
@@ -409,6 +410,37 @@ export function notFound(res, req = null) {
  * @returns {boolean} True if authenticated and authorized, false otherwise
  */
 export async function requireAuth(req, res, config, requiredScopes = []) {
+  let pathname = "";
+  try {
+    pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+  } catch {
+    pathname = "";
+  }
+  const isAdminRequest =
+    pathname === "/admin" || pathname.startsWith("/admin/") ||
+    requiredScopes.some((scope) => scope.startsWith("admin:"));
+  if (isAdminRequest && !isAdminIpAllowed(req, config)) {
+    const allowlist = config.adminIpAllowlist ?? [];
+    if (allowlist.length === 0 && config.adminIpAllowlistRequired === true) {
+      sendFormatted(req, res, 503, {
+        error: "admin_ip_allowlist_not_configured",
+        code: "ADMIN_IP_ALLOWLIST_NOT_CONFIGURED",
+        message: "Admin access is disabled until ADMIN_IP_ALLOWLIST is configured",
+      });
+    } else {
+      sendFormatted(req, res, 403, {
+        error: "admin_ip_not_allowed",
+        code: "ADMIN_IP_NOT_ALLOWED",
+        message: "This client address is not permitted to access admin endpoints",
+      });
+    }
+    logger.warn(
+      { clientIp: getClientAddress(req, config.trustProxy === true), pathname },
+      "Blocked admin request from a non-allowlisted IP address",
+    );
+    return false;
+  }
+
   const token =
     req.headers["x-api-key"] ||
     req.headers.authorization?.replace(/^Bearer\s+/i, "");
