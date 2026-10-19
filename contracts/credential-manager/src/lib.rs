@@ -185,6 +185,10 @@ pub enum ContractError {
     BatchTooLarge = 17,
     InvalidSchemaHash = 18,
     ContractPaused = 19,
+    InvalidInput = 21,
+    NotFound = 22,
+    NotWhitelisted = 23,
+    RefundWindowClosed = 24,
     /// Issue #551: a guarded function was re-entered while a prior
     /// invocation (which is mid cross-contract call) had not yet completed.
     ReentrantCall = 20,
@@ -582,6 +586,11 @@ impl<'a> Drop for ReentrancyGuard<'a> {
 
 #[contract]
 pub struct CredentialManager;
+
+mod crl;
+mod encryption;
+mod external_verify;
+mod pricing;
 
 #[contractimpl]
 impl CredentialManager {
