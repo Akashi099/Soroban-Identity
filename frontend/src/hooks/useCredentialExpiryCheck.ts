@@ -141,10 +141,24 @@ export function useCredentialExpiryCheck(
             batchRevokedRef.current.delete(cred.id);
           }
         }
-      }
-      // Invalidate any check that started before this batch.
-      checkSeqRef.current += 1;
-      recompute();
+
+        const updatedCredentials = Array.from(currentMap.values());
+        const nextCount =
+          typeof detail.deltaCount === "number"
+            ? Math.max(0, (prev?.count ?? 0) + detail.deltaCount)
+            : updatedCredentials.length;
+
+        if (nextCount === 0 && updatedCredentials.length === 0) {
+          return null;
+        }
+
+        return {
+          count: nextCount,
+          credentials: updatedCredentials,
+          readIds: Array.from(readIdsRef.current),
+          dismissed: false,
+        };
+      });
       void check();
     },
     [check, recompute]
