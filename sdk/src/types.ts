@@ -463,6 +463,58 @@ export class SimulationError extends Error {
 }
 
 /**
+ * Contract error codes introduced by the oracle, template, threshold-signature
+ * and DID-resolver features (#1124–#1127).
+ *
+ * These mirror the numeric codes returned by the contracts so callers can map
+ * a raw Soroban error to a stable SDK error code.
+ */
+export const CONTRACT_ERROR_CODES = {
+  // Oracle (#1124)
+  OracleNotFound: 4000,
+  OracleInactive: 4001,
+  OracleRequestNotFound: 4002,
+  OracleRequestExpired: 4003,
+  OracleResponseStale: 4004,
+  OracleFeeMismatch: 4005,
+  OracleSignatureInvalid: 4006,
+  OracleNoFallback: 4007,
+  // Credential templates (#1125)
+  TemplateNotFound: 4100,
+  TemplateInactive: 4101,
+  TemplateVersionMismatch: 4102,
+  TemplateValidationFailed: 4103,
+  TemplateInheritanceCycle: 4104,
+  TemplateListingNotFound: 4105,
+  TemplateUsageFeeMismatch: 4106,
+  // Threshold signatures (#1126)
+  ThresholdNotMet: 4200,
+  SignerSetNotFound: 4201,
+  SignerNotAuthorized: 4202,
+  SignerWeightInvalid: 4203,
+  SignatureExpired: 4204,
+  SignatureSchemeUnsupported: 4205,
+  SignatureAggregationFailed: 4206,
+  // DID resolver (#1127)
+  DidMethodUnsupported: 4300,
+  DidNotFound: 4301,
+  DidResolutionFailed: 4302,
+} as const;
+
+export type ContractErrorCode = (typeof CONTRACT_ERROR_CODES)[keyof typeof CONTRACT_ERROR_CODES];
+
+/** Reverse lookup: numeric contract error code → symbolic name. */
+export const CONTRACT_ERROR_NAMES: Record<number, keyof typeof CONTRACT_ERROR_CODES> =
+  Object.fromEntries(
+    Object.entries(CONTRACT_ERROR_CODES).map(([name, code]) => [code, name])
+  ) as Record<number, keyof typeof CONTRACT_ERROR_CODES>;
+
+/** Map a raw numeric contract error code to its symbolic name, if known. */
+export function contractErrorName(code: number): keyof typeof CONTRACT_ERROR_CODES | undefined {
+  return CONTRACT_ERROR_NAMES[code];
+}
+
+/**
  * Minimal account information required to build an offline transaction.
  *
  * Obtain `sequence` from Horizon or Soroban RPC before disconnecting from the
@@ -627,6 +679,290 @@ export interface VerifyMerkleProofOptions extends CallOptions {
   root?: string;
   /** Batch identifier whose stored root should be used when `root` is omitted. */
   batchId?: string;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Oracle integration (#1124)                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Configuration for a single oracle node the SDK may query for off-chain data.
+ *
+ * Mirrors the oracle-registry contract's `OracleConfig` contracttype. The
+ * `address` is the Stellar account that signs oracle responses; `fee` is the
+ * amount (in stroops) the oracle charges per request.
+ */
+export interface OracleConfig {
+  /** Unique oracle identifier (hex-encoded 32 bytes). */
+  oracleId: string;
+  /** Stellar address of the oracle node that signs responses. */
+  address: string;
+  /** Human-readable oracle name. */
+  name: string;
+  /** Fee charged per request, in stroops. */
+  fee: number;
+  /**
+   * Maximum age (seconds) of a response before it is considered stale.
+   * `0` disables staleness checks for this oracle.
+   */
+  maxStaleness: number;
+  /** `false` once the oracle has been deregistered. */
+  active: boolean;
+  /**
+   * Fallback oracle IDs consulted in order when this oracle fails or returns
+   * stale data. Empty when no fallbacks are configured.
+   */
+  fallbackOracles: string[];
+}
+
+/**
+ * Schema describing the shape of a data feed served by an oracle.
+ *
+ * The `fields` map names each field and its type so callers can validate
+ * decoded oracle payloads before trusting them.
+ */
+export interface DataFeedSchema {
+  /** Unique feed identifier (hex-encoded 32 bytes). */
+  feedId: string;
+  /** Oracle that serves this feed. */
+  oracleId: string;
+  /** Schema version; incremented when the field layout changes. */
+  version: number;
+  /** Field name → type descriptor (e.g. `"string"`, `"u32"`, `"bool"`). */
+  fields: Record<string, string>;
+  /** Unix timestamp (seconds) when the schema was registered. */
+  registeredAt: number;
+}
+
+/** Lifecycle state of an {@link OracleRequest}. */
+export type OracleRequestStatus = "Pending" | "Fulfilled" | "Failed" | "Expired";
+
+/**
+ * An outstanding or completed request for off-chain data (#1124).
+ *
+ * Created by the SDK when calling the oracle request function; the oracle
+ * later fulfils it by submitting a signed {@link OracleResponse}.
+ */
+export interface OracleRequest {
+  /** Unique request identifier (hex-encoded 32 bytes). */
+  requestId: string;
+  /** Oracle the request was sent to. */
+  oracleId: string;
+  /** Data feed the request targets. */
+  feedId: string;
+  /** Address that submitted the request (pays the oracle fee). */
+  requester: string;
+  /** Opaque request payload, hex-encoded. */
+  payload: string;
+  /** Unix timestamp (seconds) when the request was created. */
+  createdAt: number;
+  /** Unix timestamp (seconds) after which the request expires. */
+  expiresAt: number;
+  /** Current lifecycle state. */
+  status: OracleRequestStatus;
+}
+
+/**
+ * A signed response from an oracle, returned by
+ * {@link OracleClient.getResponse} once a request is fulfilled.
+ */
+export interface OracleResponse {
+  /** Request this response fulfils. */
+  requestId: string;
+  /** Oracle that produced the response. */
+  oracleId: string;
+  /** Decoded feed data, keyed by field name. */
+  data: Record<string, string>;
+  /** Hex-encoded signature over the response payload. */
+  signature: string;
+  /** Unix timestamp (seconds) the oracle reports for the data. */
+  observedAt: number;
+  /** Unix timestamp (seconds) the response was recorded on-chain. */
+  fulfilledAt: number;
+  /**
+   * `true` when `observedAt` is older than the oracle's `maxStaleness` at the
+   * time the response was read. Stale responses must not be trusted.
+   */
+  stale: boolean;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Credential templates (#1125)                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A reusable credential template stored on-chain (#1125).
+ *
+ * Templates define the credential type, default claims and validation rules
+ * that issuers can reuse when minting credentials. Templates are versioned and
+ * may inherit from a parent template.
+ */
+export interface CredentialTemplate {
+  /** Unique template identifier (hex-encoded 32 bytes). */
+  templateId: string;
+  /** Issuer that registered the template. */
+  issuer: string;
+  /** Credential type this template produces. */
+  credentialType: CredentialType;
+  /** Human-readable template name. */
+  name: string;
+  /** Default claims applied to credentials minted from this template. */
+  defaultClaims: Record<string, string>;
+  /** Validation rules keyed by claim name (e.g. `"required"`, `"maxLength:64"`). */
+  validationRules: Record<string, string>;
+  /** Monotonically increasing version; starts at 1. */
+  version: number;
+  /** Parent template ID when this template inherits from another, else `null`. */
+  parentTemplateId: string | null;
+  /** Unix timestamp (seconds) when the template was registered. */
+  createdAt: number;
+  /** Unix timestamp (seconds) of the last version bump. */
+  updatedAt: number;
+  /** `false` once the template has been deprecated. */
+  active: boolean;
+}
+
+/**
+ * A template listed for sale on the template marketplace (#1125).
+ */
+export interface TemplateListing {
+  /** Template being sold. */
+  templateId: string;
+  /** Address of the seller (must be the template issuer). */
+  seller: string;
+  /** Usage fee per mint, in stroops. `0` means free. */
+  usageFee: number;
+  /** Unix timestamp (seconds) when the listing was created. */
+  listedAt: number;
+  /** `false` once the listing has been withdrawn. */
+  active: boolean;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Threshold signatures (#1126)                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Signature scheme supported by the threshold-signature verifier (#1126).
+ *
+ * The values are the contract's variant names and are part of the wire format:
+ * never rename or reorder them.
+ */
+export const SignatureScheme = {
+  Ed25519: "Ed25519",
+  Secp256k1: "Secp256k1",
+  Secp256r1: "Secp256r1",
+} as const;
+
+export type SignatureScheme = (typeof SignatureScheme)[keyof typeof SignatureScheme];
+
+/** Every supported signature scheme, in the contract's declaration order. */
+export const SIGNATURE_SCHEMES: readonly SignatureScheme[] = [
+  SignatureScheme.Ed25519,
+  SignatureScheme.Secp256k1,
+  SignatureScheme.Secp256r1,
+];
+
+/** True when `value` is a supported {@link SignatureScheme}. */
+export function isSignatureScheme(value: unknown): value is SignatureScheme {
+  return typeof value === "string" && (SIGNATURE_SCHEMES as readonly string[]).includes(value);
+}
+
+/**
+ * A weighted signer in a {@link SignerSet}.
+ */
+export interface Signer {
+  /** Stellar address of the signer. */
+  address: string;
+  /** Relative weight of this signer's signature. Must be > 0. */
+  weight: number;
+  /** Signature scheme this signer uses. */
+  scheme: SignatureScheme;
+}
+
+/**
+ * A dynamic set of weighted signers with a threshold (#1126).
+ *
+ * A payload is valid when the sum of weights of the signers that produced a
+ * valid signature is greater than or equal to `threshold`.
+ */
+export interface SignerSet {
+  /** Unique signer-set identifier (hex-encoded 32 bytes). */
+  signerSetId: string;
+  /** Weighted signers. */
+  signers: Signer[];
+  /** Minimum total weight required to authorise an operation. */
+  threshold: number;
+  /** Unix timestamp (seconds) after which signatures are rejected. `0` = no expiry. */
+  expiresAt: number;
+}
+
+/**
+ * A payload signed by one or more signers under a {@link SignerSet} (#1126).
+ */
+export interface SignedPayload {
+  /** Signer set the signatures are validated against. */
+  signerSetId: string;
+  /** Hex-encoded payload that was signed. */
+  payload: string;
+  /** Individual signatures, one per signer. */
+  signatures: Array<{
+    /** Address of the signer that produced this signature. */
+    signer: string;
+    /** Hex-encoded signature bytes. */
+    signature: string;
+    /** Scheme used to produce the signature. */
+    scheme: SignatureScheme;
+  }>;
+  /** Unix timestamp (seconds) when the payload was signed. */
+  signedAt: number;
+}
+
+/* -------------------------------------------------------------------------- */
+/* DID resolver (#1127)                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * DID method supported by the universal resolver (#1127).
+ *
+ * `Stellar` is the native method; the others are resolved via adapters.
+ */
+export const DidMethod = {
+  Stellar: "Stellar",
+  Key: "Key",
+  Web: "Web",
+  Ethr: "Ethr",
+} as const;
+
+export type DidMethod = (typeof DidMethod)[keyof typeof DidMethod];
+
+/** Every supported DID method, in the contract's declaration order. */
+export const DID_METHODS: readonly DidMethod[] = [
+  DidMethod.Stellar,
+  DidMethod.Key,
+  DidMethod.Web,
+  DidMethod.Ethr,
+];
+
+/** True when `value` is a supported {@link DidMethod}. */
+export function isDidMethod(value: unknown): value is DidMethod {
+  return typeof value === "string" && (DID_METHODS as readonly string[]).includes(value);
+}
+
+/**
+ * A DID document resolved by the universal resolver (#1127).
+ *
+ * Extends {@link DidDocument} with the method that produced it and resolution
+ * metadata so callers can tell which adapter answered and whether the result
+ * came from cache.
+ */
+export interface ResolvedDidDocument extends DidDocument {
+  /** DID method that resolved this document. */
+  method: DidMethod;
+  /** Unix timestamp (seconds) when the document was resolved. */
+  resolvedAt: number;
+  /** `true` when the document was served from a local cache. */
+  fromCache: boolean;
 }
 
 /* -------------------------------------------------------------------------- */

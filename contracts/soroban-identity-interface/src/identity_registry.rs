@@ -1,7 +1,7 @@
 //! Stable trait ABI for the `identity-registry` contract.
 
 use identity_registry::{
-    ContractError, DidDocument, IdentityRegistry, IdentityStorageStats, ResolverPlugin,
+    ContractError, DidDocument, DidMethod, IdentityRegistry, IdentityStorageStats, ResolverPlugin,
     ServiceEndpoint,
 };
 use soroban_sdk::{Address, BytesN, Env, Map, String, Vec};
@@ -98,6 +98,34 @@ pub trait IdentityRegistryInterface {
 
     /// Validate a DID document against the resolver's structural rules.
     fn validate_did_document(env: Env, document: DidDocument) -> Result<bool, ContractError>;
+
+    fn register_did_method(
+        env: Env,
+        controller: Address,
+        method: DidMethod,
+    ) -> Result<(), ContractError>;
+
+    fn resolve_did_string(env: Env, did: String) -> Result<DidDocument, ContractError>;
+
+    fn get_did_methods(env: Env, controller: Address) -> Result<Vec<DidMethod>, ContractError>;
+
+    fn initiate_signer_rotation(
+        env: Env,
+        controller: Address,
+        new_signers: Vec<Address>,
+    ) -> Result<u32, ContractError>;
+
+    fn approve_signer_rotation(
+        env: Env,
+        signer: Address,
+        rotation_id: u32,
+    ) -> Result<(), ContractError>;
+
+    fn complete_signer_rotation(
+        env: Env,
+        controller: Address,
+        rotation_id: u32,
+    ) -> Result<(), ContractError>;
 }
 
 /// Blanket implementation delegating to `IdentityRegistry`'s existing
@@ -229,5 +257,45 @@ impl IdentityRegistryInterface for IdentityRegistry {
 
     fn validate_did_document(env: Env, document: DidDocument) -> Result<bool, ContractError> {
         Self::validate_did_document(env, document)
+    }
+
+    fn register_did_method(
+        env: Env,
+        controller: Address,
+        method: DidMethod,
+    ) -> Result<(), ContractError> {
+        Self::register_did_method(env, controller, method)
+    }
+
+    fn resolve_did_string(env: Env, did: String) -> Result<DidDocument, ContractError> {
+        Self::resolve_did_string(env, did)
+    }
+
+    fn get_did_methods(env: Env, controller: Address) -> Result<Vec<DidMethod>, ContractError> {
+        Self::get_did_methods(env, controller)
+    }
+
+    fn initiate_signer_rotation(
+        env: Env,
+        controller: Address,
+        new_signers: Vec<Address>,
+    ) -> Result<u32, ContractError> {
+        Self::initiate_signer_rotation(env, controller, new_signers)
+    }
+
+    fn approve_signer_rotation(
+        env: Env,
+        signer: Address,
+        rotation_id: u32,
+    ) -> Result<(), ContractError> {
+        Self::approve_signer_rotation(env, signer, rotation_id)
+    }
+
+    fn complete_signer_rotation(
+        env: Env,
+        controller: Address,
+        rotation_id: u32,
+    ) -> Result<(), ContractError> {
+        Self::complete_signer_rotation(env, controller, rotation_id)
     }
 }

@@ -9,6 +9,9 @@ use soroban_sdk::xdr::ToXdr;
 
 pub mod recovery;
 pub mod resolver;
+pub mod did_resolver;
+
+pub use did_resolver::{DidMethod, ResolvedDid};
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -45,18 +48,22 @@ pub enum ContractError {
     RecoveryNotAuthorized = 21,
     /// `recover_did` would transfer the DID to an address that already owns one.
     RecoveryTargetExists = 22,
+    /// The DID string passed to the universal resolver is malformed or empty.
+    InvalidDid = 23,
+    /// The DID method (e.g. `stellar`) is not supported by the resolver.
+    UnsupportedDidMethod = 24,
+    /// The DID method is already registered with the resolver.
+    DidMethodAlreadyRegistered = 25,
     /// The DID string uses a method that has no registered resolver.
-    UnknownDidMethod = 23,
+    UnknownDidMethod = 26,
     /// The resolved DID document is missing required fields or is malformed.
-    InvalidDidDocument = 24,
+    InvalidDidDocument = 27,
     /// No cached resolution exists for the requested DID (or it has expired).
-    CacheMiss = 25,
+    CacheMiss = 28,
     /// A resolver plugin operation failed (bad registration, duplicate, etc.).
-    ResolverPluginError = 26,
-    /// The DID string is malformed for its method.
-    InvalidDid = 27,
+    ResolverPluginError = 29,
     /// The fallback chain is empty or exceeds the maximum supported length.
-    InvalidFallbackChain = 28,
+    InvalidFallbackChain = 30,
 }
 
 /// Version returned by `ping` for deployment health checks.
@@ -616,6 +623,46 @@ impl IdentityRegistry {
             return Err(ContractError::DidDeactivated);
         }
         Ok(doc)
+    }
+
+    // ── Universal DID resolver (#1127) ────────────────────────────────────────
+
+    /// Registers a DID method with the universal resolver. Admin-only.
+    ///
+    /// The `stellar` method is registered by default and cannot be re-registered.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::Unauthorized`] if `admin` is not the current admin.
+    /// Returns [`ContractError::DidMethodAlreadyRegistered`] if the method is already known.
+    pub fn register_did_method(
+        env: Env,
+        admin: Address,
+        method: DidMethod,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        did_resolver::register_method(&env, &method)
+    }
+
+    /// Universal string-based DID resolver. Accepts a full DID string such as
+    /// `did:stellar:<address>` and returns the resolved document together with
+    /// the method that handled it.
+    ///
+    /// The legacy [`Self::resolve_did`] entrypoint (address-based) remains
+    /// available for backward compatibility.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::InvalidDid`] if `did` is empty or malformed.
+    /// Returns [`ContractError::UnsupportedDidMethod`] if the method is not registered.
+    /// Returns [`ContractError::DidNotFound`] / [`ContractError::DidDeactivated`]
+    /// depending on the resolved document's state.
+    pub fn resolve_did_string(env: Env, did: String) -> Result<ResolvedDid, ContractError> {
+        did_resolver::resolve(&env, &did)
+    }
+
+    /// Returns the list of DID methods currently supported by the resolver.
+    pub fn get_did_methods(env: Env) -> Vec<DidMethod> {
+        did_resolver::get_methods(&env)
     }
 
     pub fn has_active_did(env: Env, controller: Address) -> bool {
