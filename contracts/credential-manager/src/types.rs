@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Map, String};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Map, String, Vec};
 
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
@@ -212,4 +212,77 @@ pub mod transfer_keys {
         FeeConfig,
         Policy(u32),
     }
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum TemplateValidationRule {
+    Required = 0,
+    MinLength = 1,
+    MaxLength = 2,
+    Pattern = 3,
+    Numeric = 4,
+    DateRange = 5,
+    OneOf = 6,
+    Custom = 7,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TemplateListing {
+    pub template_id: BytesN<32>,
+    pub seller: Address,
+    pub price: i128,
+    pub currency: Address,
+    pub active: bool,
+    pub listed_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum SignatureScheme {
+    Ed25519 = 0,
+    Secp256k1 = 1,
+    SorobanAuth = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignerSet {
+    pub signers: Vec<(Address, u32)>,
+    pub threshold: u32,
+    pub scheme: SignatureScheme,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignedPayload {
+    pub payload_hash: BytesN<32>,
+    pub signatures: Vec<Bytes>,
+    pub expiry: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DidMethod {
+    Soroban = 0,
+    Web = 1,
+    Key = 2,
+    Custom = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DidDocument {
+    pub did: String,
+    pub method: DidMethod,
+    pub controller: Address,
+    pub public_keys: Vec<Bytes>,
+    pub services: Map<String, String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub deactivated: bool,
 }

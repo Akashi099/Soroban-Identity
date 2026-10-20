@@ -19,6 +19,11 @@ pub use suspension::{CredentialStatus, SuspensionReason, SuspensionRecord};
 mod bundle;
 pub use bundle::{BundleVerificationResult, CredentialBundle};
 
+mod oracle;
+pub use oracle::{
+    DataFeedSchema, OracleConfig, OracleNode, OracleRequest, OracleResponse,
+};
+
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
@@ -141,6 +146,22 @@ const ESCROW_SEQ: Symbol = symbol_short!("ESCRSEQ");
 /// Reverse index: maps a depositor address to the escrow IDs they created.
 const ESCROW_BY_DEPOSITOR: Symbol = symbol_short!("ESCBYDEP");
 
+// ── Issue #1124: off-chain oracle integration storage keys ───────────────────
+/// Maps an oracle node address to its [`OracleConfig`].
+const ORACLE_CFG: Symbol = symbol_short!("ORACLECFG");
+/// Maps a feed id to its [`DataFeedSchema`].
+const ORACLE_FEED: Symbol = symbol_short!("ORACLFEED");
+/// Maps a request id to its [`OracleRequest`].
+const ORACLE_REQ: Symbol = symbol_short!("ORACLREQ");
+/// Maps a request id to its [`OracleResponse`] once fulfilled.
+const ORACLE_RESP: Symbol = symbol_short!("ORACLRESP");
+/// Maps a feed id to its configured fallback oracle nodes.
+const ORACLE_FALLBACK: Symbol = symbol_short!("ORACLFALL");
+/// Maps a feed id to the configured oracle fee.
+const ORACLE_FEE: Symbol = symbol_short!("ORACLFEE");
+/// Sequence number for generating unique oracle request IDs.
+const ORACLE_SEQ: Symbol = symbol_short!("ORACLSEQ");
+
 #[contracterror]
 #[derive(Clone, Debug, PartialEq, Copy)]
 pub enum ContractError {
@@ -164,6 +185,10 @@ pub enum ContractError {
     BatchTooLarge = 17,
     InvalidSchemaHash = 18,
     ContractPaused = 19,
+    InvalidInput = 21,
+    NotFound = 22,
+    NotWhitelisted = 23,
+    RefundWindowClosed = 24,
     /// Issue #551: a guarded function was re-entered while a prior
     /// invocation (which is mid cross-contract call) had not yet completed.
     ReentrantCall = 20,
@@ -218,6 +243,18 @@ pub enum ContractError {
     BundleNotFound = 53,
     /// Issue #1058: credential bundle must contain at least one credential.
     EmptyBundle = 54,
+    /// Issue #1124: the oracle node is not registered.
+    OracleNotFound = 55,
+    /// Issue #1124: the data feed schema is not registered.
+    FeedSchemaNotFound = 56,
+    /// Issue #1124: the oracle request was not found.
+    OracleRequestNotFound = 57,
+    /// Issue #1124: the oracle response is stale (older than the feed's max age).
+    StaleOracleData = 58,
+    /// Issue #1124: the oracle request has already been fulfilled.
+    OracleRequestAlreadyFulfilled = 59,
+    /// Issue #1124: the caller is not an authorized oracle node for this feed.
+    UnauthorizedOracle = 60,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -549,6 +586,11 @@ impl<'a> Drop for ReentrancyGuard<'a> {
 
 #[contract]
 pub struct CredentialManager;
+
+mod crl;
+mod encryption;
+mod external_verify;
+mod pricing;
 
 #[contractimpl]
 impl CredentialManager {
@@ -2424,6 +2466,120 @@ impl CredentialManager {
                 .extend_ttl(&cnt_key, TTL_MAX, TTL_MAX);
         }
         env.storage().persistent().get(&cnt_key).unwrap_or(0)
+    }
+
+    // ── Issue #1124: off-chain oracle integration ─────────────────────────────
+
+    /// Registers (or updates) an oracle node. Admin only.
+    pub fn register_oracle(
+        env: Env,
+        admin: Address,
+        node: Address,
+        endpoint: String,
+        active: bool,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(ContractError::NotInitialized)?;
+        if stored != admin {
+            return Err(ContractError::Unauthorized);
+        }
+        oracle::register_oracle(&env, &node, endpoint, active);
+        Ok(())
+    }
+
+    /// Defines (or updates) the data feed schema for a feed id. Admin only.
+    pub fn set_feed_schema(
+        env: Env,
+        admin: Address,
+        feed_id: Symbol,
+        schema: DataFeedSchema,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(ContractError::NotInitialized)?;
+        if stored != admin {
+            return Err(ContractError::Unauthorized);
+        }
+        oracle::set_feed_schema(&env, &feed_id, schema);
+        Ok(())
+    }
+
+    /// Configures the oracle fee charged per request for a feed. Admin only.
+    pub fn set_oracle_fee(
+        env: Env,
+        admin: Address,
+        feed_id: Symbol,
+        fee: i128,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(ContractError::NotInitialized)?;
+        if stored != admin {
+            return Err(ContractError::Unauthorized);
+        }
+        oracle::set_oracle_fee(&env, &feed_id, fee);
+        Ok(())
+    }
+
+    /// Configures the ordered list of fallback oracle nodes for a feed. Admin only.
+    pub fn set_fallback_oracles(
+        env: Env,
+        admin: Address,
+        feed_id: Symbol,
+        fallbacks: Vec<Address>,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(ContractError::NotInitialized)?;
+        if stored != admin {
+            return Err(ContractError::Unauthorized);
+        }
+        oracle::set_fallback_oracles(&env, &feed_id, fallbacks);
+        Ok(())
+    }
+
+    /// Creates an off-chain data request against a registered feed schema.
+    /// Returns the generated request id.
+    pub fn request_offchain_data(
+        env: Env,
+        requester: Address,
+        feed_id: Symbol,
+        payload: Bytes,
+    ) -> Result<BytesN<32>, ContractError> {
+        requester.require_auth();
+        Self::require_not_paused(&env)?;
+        oracle::request_offchain_data(&env, &requester, &feed_id, payload)
+    }
+
+    /// Fulfils a pending oracle request. Only an authorized oracle node (the
+    /// primary or a configured fallback) may call this.
+    pub fn oracle_callback(
+        env: Env,
+        node: Address,
+        request_id: BytesN<32>,
+        data: Bytes,
+    ) -> Result<(), ContractError> {
+        node.require_auth();
+        oracle::oracle_callback(&env, &node, &request_id, data)
+    }
+
+    /// Returns whether the stored response for `request_id` is still fresh
+    /// according to the feed's configured max age.
+    pub fn is_response_fresh(env: Env, request_id: BytesN<32>) -> bool {
+        oracle::is_response_fresh(&env, &request_id)
     }
 
     pub fn get_issuers(env: Env) -> Vec<Address> {

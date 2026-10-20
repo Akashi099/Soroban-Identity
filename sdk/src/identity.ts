@@ -20,6 +20,12 @@ import {
   buildHasActiveDidArgs,
   buildDeactivateDidArgs,
   buildDidExistsArgs,
+  buildRegisterDidMethodArgs,
+  buildResolveDidStringArgs,
+  buildGetDidMethodsArgs,
+  buildInitiateSignerRotationArgs,
+  buildApproveSignerRotationArgs,
+  buildCompleteSignerRotationArgs,
 } from "./contract-args";
 
 const PROBE_ADDRESS = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
@@ -493,6 +499,408 @@ export class IdentityClient extends BaseClient {
       (address) => this.resolveDid(address, options),
       concurrency
     );
+  }
+
+  /**
+   * Register a DID method (e.g. `did:soroban`, `did:key`) with the resolver.
+   *
+   * @param keypair  Admin keypair authorized to register methods.
+   * @param method   The DID method name (without the `did:` prefix).
+   * @param options  Per-call overrides.
+   * @throws {SorobanIdentityError} with code `UNAUTHORIZED` if the caller is not an admin.
+   */
+  async registerDidMethod(
+    keypair: Keypair,
+    method: string,
+    options?: CallOptions
+  ): Promise<SorobanResponse<void>> {
+    const account = await this.server.getAccount(keypair.publicKey());
+    const timeout = options?.timeoutSeconds ?? this.config.txTimeout ?? 30;
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call(
+          "register_did_method",
+          ...buildRegisterDidMethodArgs({ method })
+        )
+      )
+      .setTimeout(timeout)
+      .build();
+
+    const prepared = await retryWithBackoff(() => this.server.prepareTransaction(tx));
+    prepared.sign(keypair);
+
+    const result = await retryWithBackoff(() => this.server.sendTransaction(prepared));
+    this.debug('sdk.submission_outcome', { operation: 'identity.registerDidMethod.sendTransaction', status: result.status });
+    if (result.status !== "PENDING") {
+      throw new SorobanIdentityError(`Transaction failed: ${result.status}`, "CONTRACT_ERROR");
+    }
+
+    const txHash = result.hash;
+    try {
+      await pollTransactionStatus(this.server, txHash, {
+        maxRetries: this.config.maxRetries ?? this.config.pollingRetries,
+        retryIntervalMs: this.config.retryIntervalMs ?? this.config.pollingIntervalMs,
+        exponentialBackoff: this.config.pollingExponentialBackoff,
+      });
+    } catch (e: unknown) {
+      if (e instanceof SorobanIdentityError && e.code === "TIMEOUT") throw e;
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("require_auth") || msg.includes("not authorized")) {
+        throw new SorobanIdentityError(
+          `Address ${keypair.publicKey()} is not authorized to register DID methods.`,
+          "UNAUTHORIZED"
+        );
+      }
+      if (msg.includes("MethodAlreadyRegistered") || msg.includes("already registered")) {
+        throw new SorobanIdentityError(
+          `DID method "${method}" is already registered.`,
+          "VALIDATION_ERROR"
+        );
+      }
+      throw wrapError(e);
+    }
+    return { data: undefined, txHash };
+  }
+
+  /**
+   * Resolve a DID string (e.g. `did:soroban:GABC...`) to its DID document.
+   *
+   * @param didString The full DID string to resolve.
+   * @param options   Per-call overrides.
+   * @throws {SorobanIdentityError} with code `NOT_FOUND` if the DID cannot be resolved.
+   */
+  async resolveDidString(didString: string, options?: CallOptions): Promise<DidDocument> {
+    if (!didString.startsWith("did:")) {
+      throw new SorobanIdentityError(
+        `Invalid DID string "${didString}": must start with "did:".`,
+        "VALIDATION_ERROR"
+      );
+    }
+    const account = new Account(PROBE_ADDRESS, "0");
+    const timeout = options?.timeoutSeconds ?? this.config.txTimeout ?? 30;
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call(
+          "resolve_did_string",
+          ...buildResolveDidStringArgs({ didString })
+        )
+      )
+      .setTimeout(timeout)
+      .build();
+
+    const maxRetries = options?.maxRetries ?? this.config.maxRetries ?? 5;
+    const baseDelayMs = options?.baseDelayMs ?? this.config.baseDelayMs ?? 500;
+    const backoffFactor = options?.backoffFactor ?? this.config.backoffFactor ?? 2;
+
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const result = await this.server.simulateTransaction(tx);
+        const isSimulationError = SorobanRpc.Api.isSimulationError(result);
+        this.debug('sdk.simulation_result', { operation: 'identity.resolveDidString', success: !isSimulationError });
+        if (isSimulationError) {
+          const errMsg = result.error ?? "";
+          const contractErr = ContractError.extract(errMsg, IDENTITY_REGISTRY_ERRORS);
+          if (contractErr) throw contractErr;
+          if (errMsg.includes("UnsupportedDidMethod")) {
+            throw new SorobanIdentityError(
+              `DID method in "${didString}" is not supported by the resolver.`,
+              "VALIDATION_ERROR"
+            );
+          }
+          if (errMsg.includes("DidNotFound")) {
+            throw new SorobanIdentityError(`NOT_FOUND: No DID found for "${didString}".`, "NOT_FOUND");
+          }
+          throw new SorobanIdentityError(`Simulation failed: ${errMsg}`, "CONTRACT_ERROR");
+        }
+        const retval = (result as SorobanRpc.Api.SimulateTransactionSuccessResponse).result!.retval;
+        if (retval && typeof retval === "object" && "id" in (retval as unknown as Record<string, unknown>)) {
+          return retval as unknown as DidDocument;
+        }
+        return scValToNative(retval) as DidDocument;
+      } catch (err) {
+        if (attempt === maxRetries || !isRetryableResolveError(err)) throw err;
+        lastError = err;
+        const delayMs = Math.floor(baseDelayMs * Math.pow(backoffFactor, attempt) + Math.random() * 100);
+        this.debug(`[identity] resolveDidString retry ${attempt + 1}/${maxRetries} after ${delayMs}ms`, {});
+        await sleep(delayMs);
+      }
+    }
+    throw lastError;
+  }
+
+  /**
+   * List all DID methods supported by the resolver.
+   */
+  async getDidMethods(options?: CallOptions): Promise<string[]> {
+    const account = new Account(PROBE_ADDRESS, "0");
+    const timeout = options?.timeoutSeconds ?? this.config.txTimeout ?? 30;
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call(
+          "get_did_methods",
+          ...buildGetDidMethodsArgs()
+        )
+      )
+      .setTimeout(timeout)
+      .build();
+
+    const result = await retryWithBackoff(() => this.server.simulateTransaction(tx));
+    const isSimulationError = SorobanRpc.Api.isSimulationError(result);
+    this.debug('sdk.simulation_result', { operation: 'identity.getDidMethods', success: !isSimulationError });
+    if (isSimulationError) {
+      const errMsg = result.error ?? "";
+      const contractErr = ContractError.extract(errMsg, IDENTITY_REGISTRY_ERRORS);
+      if (contractErr) throw contractErr;
+      throw new SorobanIdentityError(`Simulation failed: ${errMsg}`, "CONTRACT_ERROR");
+    }
+
+    return scValToNative(
+      (result as SorobanRpc.Api.SimulateTransactionSuccessResponse).result!.retval
+    ) as string[];
+  }
+
+  /**
+   * Initiate a signer rotation for a DID. The rotation must be approved by the
+   * required threshold of signers before it can be completed.
+   *
+   * @param keypair     Controller of the DID whose signer set is being rotated.
+   * @param newSigners  The proposed signer set (address → weight).
+   * @param threshold   The new signature threshold.
+   * @param options     Per-call overrides.
+   * @throws {SorobanIdentityError} with code `NOT_FOUND` or `UNAUTHORIZED`.
+   */
+  async initiateSignerRotation(
+    keypair: Keypair,
+    newSigners: Record<string, number>,
+    threshold: number,
+    options?: CallOptions
+  ): Promise<SorobanResponse<{ rotationId: string } & WriteResult>> {
+    const account = await this.server.getAccount(keypair.publicKey());
+    const timeout = options?.timeoutSeconds ?? this.config.txTimeout ?? 30;
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call(
+          "initiate_signer_rotation",
+          ...buildInitiateSignerRotationArgs({
+            controller: keypair.publicKey(),
+            newSigners,
+            threshold,
+          })
+        )
+      )
+      .setTimeout(timeout)
+      .build();
+
+    const prepared = await retryWithBackoff(() => this.server.prepareTransaction(tx));
+    const estimatedFee = parseInt(prepared.fee, 10);
+    const estimatedFeeXlm = (estimatedFee / 10_000_000).toFixed(7);
+    prepared.sign(keypair);
+
+    const result = await retryWithBackoff(() => this.server.sendTransaction(prepared));
+    this.debug('sdk.submission_outcome', { operation: 'identity.initiateSignerRotation.sendTransaction', status: result.status });
+    if (result.status !== "PENDING") {
+      throw new SorobanIdentityError(`Transaction failed: ${result.status}`, "CONTRACT_ERROR");
+    }
+
+    const txHash = result.hash;
+    try {
+      await pollTransactionStatus(this.server, txHash, {
+        maxRetries: this.config.maxRetries ?? this.config.pollingRetries,
+        retryIntervalMs: this.config.retryIntervalMs ?? this.config.pollingIntervalMs,
+        exponentialBackoff: this.config.pollingExponentialBackoff,
+      });
+      const confirmed = await this.server.getTransaction(txHash) as SorobanRpc.Api.GetSuccessfulTransactionResponse;
+      const rotationId = scValToNative(confirmed.returnValue!) as string;
+      return { data: { rotationId, estimatedFee, estimatedFeeXlm }, txHash };
+    } catch (e: unknown) {
+      if (e instanceof SorobanIdentityError && e.code === "TIMEOUT") throw e;
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("DID not found")) {
+        throw new SorobanIdentityError(
+          `No DID found for address ${keypair.publicKey()}. Create one first with createDid.`,
+          "NOT_FOUND"
+        );
+      }
+      if (msg.includes("require_auth") || msg.includes("not authorized")) {
+        throw new SorobanIdentityError(
+          `Address ${keypair.publicKey()} is not the controller of this DID.`,
+          "UNAUTHORIZED"
+        );
+      }
+      if (msg.includes("InvalidThreshold") || msg.includes("invalid threshold")) {
+        throw new SorobanIdentityError(
+          `Invalid threshold ${threshold} for the proposed signer set.`,
+          "VALIDATION_ERROR"
+        );
+      }
+      throw wrapError(e);
+    }
+  }
+
+  /**
+   * Approve a pending signer rotation. Each approval contributes the signer's
+   * configured weight toward the rotation threshold.
+   *
+   * @param keypair    A signer approving the rotation.
+   * @param rotationId The rotation to approve.
+   * @param options    Per-call overrides.
+   * @throws {SorobanIdentityError} with code `NOT_FOUND` or `UNAUTHORIZED`.
+   */
+  async approveSignerRotation(
+    keypair: Keypair,
+    rotationId: string,
+    options?: CallOptions
+  ): Promise<SorobanResponse<void>> {
+    const account = await this.server.getAccount(keypair.publicKey());
+    const timeout = options?.timeoutSeconds ?? this.config.txTimeout ?? 30;
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call(
+          "approve_signer_rotation",
+          ...buildApproveSignerRotationArgs({ rotationId })
+        )
+      )
+      .setTimeout(timeout)
+      .build();
+
+    const prepared = await retryWithBackoff(() => this.server.prepareTransaction(tx));
+    prepared.sign(keypair);
+
+    const result = await retryWithBackoff(() => this.server.sendTransaction(prepared));
+    this.debug('sdk.submission_outcome', { operation: 'identity.approveSignerRotation.sendTransaction', status: result.status });
+    if (result.status !== "PENDING") {
+      throw new SorobanIdentityError(`Transaction failed: ${result.status}`, "CONTRACT_ERROR");
+    }
+
+    const txHash = result.hash;
+    try {
+      await pollTransactionStatus(this.server, txHash, {
+        maxRetries: this.config.maxRetries ?? this.config.pollingRetries,
+        retryIntervalMs: this.config.retryIntervalMs ?? this.config.pollingIntervalMs,
+        exponentialBackoff: this.config.pollingExponentialBackoff,
+      });
+    } catch (e: unknown) {
+      if (e instanceof SorobanIdentityError && e.code === "TIMEOUT") throw e;
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("RotationNotFound") || msg.includes("rotation not found")) {
+        throw new SorobanIdentityError(
+          `Signer rotation "${rotationId}" was not found.`,
+          "NOT_FOUND"
+        );
+      }
+      if (msg.includes("require_auth") || msg.includes("not authorized")) {
+        throw new SorobanIdentityError(
+          `Address ${keypair.publicKey()} is not authorized to approve this rotation.`,
+          "UNAUTHORIZED"
+        );
+      }
+      if (msg.includes("RotationExpired") || msg.includes("expired")) {
+        throw new SorobanIdentityError(
+          `Signer rotation "${rotationId}" has expired.`,
+          "VALIDATION_ERROR"
+        );
+      }
+      throw wrapError(e);
+    }
+    return { data: undefined, txHash };
+  }
+
+  /**
+   * Complete a signer rotation once the approval threshold has been met.
+   *
+   * @param keypair    The controller completing the rotation.
+   * @param rotationId The rotation to complete.
+   * @param options    Per-call overrides.
+   * @throws {SorobanIdentityError} with code `NOT_FOUND`, `UNAUTHORIZED` or `VALIDATION_ERROR`.
+   */
+  async completeSignerRotation(
+    keypair: Keypair,
+    rotationId: string,
+    options?: CallOptions
+  ): Promise<SorobanResponse<void>> {
+    const account = await this.server.getAccount(keypair.publicKey());
+    const timeout = options?.timeoutSeconds ?? this.config.txTimeout ?? 30;
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call(
+          "complete_signer_rotation",
+          ...buildCompleteSignerRotationArgs({ rotationId })
+        )
+      )
+      .setTimeout(timeout)
+      .build();
+
+    const prepared = await retryWithBackoff(() => this.server.prepareTransaction(tx));
+    prepared.sign(keypair);
+
+    const result = await retryWithBackoff(() => this.server.sendTransaction(prepared));
+    this.debug('sdk.submission_outcome', { operation: 'identity.completeSignerRotation.sendTransaction', status: result.status });
+    if (result.status !== "PENDING") {
+      throw new SorobanIdentityError(`Transaction failed: ${result.status}`, "CONTRACT_ERROR");
+    }
+
+    const txHash = result.hash;
+    try {
+      await pollTransactionStatus(this.server, txHash, {
+        maxRetries: this.config.maxRetries ?? this.config.pollingRetries,
+        retryIntervalMs: this.config.retryIntervalMs ?? this.config.pollingIntervalMs,
+        exponentialBackoff: this.config.pollingExponentialBackoff,
+      });
+    } catch (e: unknown) {
+      if (e instanceof SorobanIdentityError && e.code === "TIMEOUT") throw e;
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("RotationNotFound") || msg.includes("rotation not found")) {
+        throw new SorobanIdentityError(
+          `Signer rotation "${rotationId}" was not found.`,
+          "NOT_FOUND"
+        );
+      }
+      if (msg.includes("require_auth") || msg.includes("not authorized")) {
+        throw new SorobanIdentityError(
+          `Address ${keypair.publicKey()} is not authorized to complete this rotation.`,
+          "UNAUTHORIZED"
+        );
+      }
+      if (msg.includes("ThresholdNotMet") || msg.includes("threshold not met")) {
+        throw new SorobanIdentityError(
+          `Signer rotation "${rotationId}" has not met its approval threshold.`,
+          "VALIDATION_ERROR"
+        );
+      }
+      if (msg.includes("RotationExpired") || msg.includes("expired")) {
+        throw new SorobanIdentityError(
+          `Signer rotation "${rotationId}" has expired.`,
+          "VALIDATION_ERROR"
+        );
+      }
+      throw wrapError(e);
+    }
+    return { data: undefined, txHash };
   }
 
   /**

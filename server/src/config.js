@@ -3,6 +3,11 @@ import { logger } from './logger.js';
 import { parseCronExpression } from './cron.js';
 
 const DEFAULT_DATA_DIR = path.resolve(process.cwd(), "data");
+// Defaults used by the optional session-key encryption feature. The sensitive
+// field list remains empty so deployments must opt in to fields explicitly.
+const DEFAULT_ENCRYPTION_KEY_ROTATION_SECONDS = 900;
+const DEFAULT_ENCRYPTION_SESSION_TTL_SECONDS = 24 * 60 * 60;
+const DEFAULT_ENCRYPTION_SENSITIVE_FIELDS = [];
 
 /**
  * Parse an integer from a string environment variable value.
@@ -247,6 +252,14 @@ export function loadConfig(env = process.env) {
     mockApiEnabled: nodeEnv !== "production" && parseBoolean(env.MOCK_API_ENABLED, false),
     port: parseInteger(env.PORT, 3001),
     adminApiKey: env.ADMIN_API_KEY ?? "",
+    adminIpAllowlist: parseList(env.ADMIN_IP_ALLOWLIST, []),
+    // Production admin routes are unavailable until an explicit allowlist is
+    // supplied. Set ADMIN_IP_ALLOWLIST_REQUIRED=false only for a deliberate
+    // migration window; a configured list is always enforced.
+    adminIpAllowlistRequired: parseBoolean(
+      env.ADMIN_IP_ALLOWLIST_REQUIRED,
+      nodeEnv === "production",
+    ),
     adminActor: env.ADMIN_ACTOR ?? "admin",
     corsAllowedOrigins: parseCorsOrigins(
       env.CORS_ORIGIN ?? env.CORS_ALLOWED_ORIGINS,

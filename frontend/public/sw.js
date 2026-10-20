@@ -1,16 +1,26 @@
 // Service Worker for Soroban Identity PWA
 // Handles offline caching and sync
 
+const CACHE_PREFIX = 'soroban-identity-';
 const CACHE_VERSION = 'v2';
-const CACHE_NAME = `soroban-identity-${CACHE_VERSION}`;
-const STATIC_CACHE_NAME = `soroban-identity-static-${CACHE_VERSION}`;
-const API_CACHE_NAME = `soroban-identity-api-${CACHE_VERSION}`;
-const STATIC_ASSETS = [
-  '/',
-  '/index.html',
-  '/manifest.json',
-  '/vite-env.d.ts',
-];
+const STATIC_CACHE = `${CACHE_PREFIX}static-${CACHE_VERSION}`;
+const API_CACHE = `${CACHE_PREFIX}api-${CACHE_VERSION}`;
+const CURRENT_CACHES = [STATIC_CACHE, API_CACHE];
+
+// App shell. Every entry must exist in the production build: cache.addAll()
+// is all-or-nothing, so a single 404 leaves the precache empty.
+const STATIC_ASSETS = ['/', '/index.html', '/manifest.json'];
+const APP_SHELL_URL = '/index.html';
+
+// API responses (#1079): network first, falling back to the last good copy
+// when offline or when the network is slower than API_NETWORK_TIMEOUT_MS.
+const API_PATH_PREFIX = '/api/';
+const API_NETWORK_TIMEOUT_MS = 4000;
+const API_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const API_CACHE_MAX_ENTRIES = 100;
+const CACHED_AT_HEADER = 'sw-cached-at';
+// Set on responses served from the API cache so the app can flag stale data.
+const CACHE_STATUS_HEADER = 'x-sw-cache';
 
 // TTLs per data type (milliseconds) - aligned with L2/L3 cache policies
 const CACHE_TTLS = {
@@ -69,7 +79,7 @@ function isExpired(response, ttl) {
 // Install event - cache static assets
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => {
+    caches.open(STATIC_CACHE).then((cache) => {
       return cache.addAll(STATIC_ASSETS).catch((error) => {
         console.warn('Failed to cache some static assets:', error);
       });
@@ -78,16 +88,18 @@ self.addEventListener('install', (event) => {
   self.skipWaiting();
 });
 
-// Activate event - clean up old caches
+// Activate event - remove this app's caches from older versions. Caches
+// with other names on the same origin are left alone.
 self.addEventListener('activate', (event) => {
   const currentCaches = [CACHE_NAME, STATIC_CACHE_NAME, API_CACHE_NAME];
   event.waitUntil(
     caches.keys().then((cacheNames) => {
       return Promise.all(
         cacheNames.map((cacheName) => {
-          if (!currentCaches.includes(cacheName)) {
+          if (cacheName.startsWith(CACHE_PREFIX) && !CURRENT_CACHES.includes(cacheName)) {
             return caches.delete(cacheName);
           }
+          return undefined;
         })
       );
     })
@@ -95,93 +107,182 @@ self.addEventListener('activate', (event) => {
   self.clients.claim();
 });
 
-// Fetch event - serve from cache, fall back to network
 self.addEventListener('fetch', (event) => {
+  const { request } = event;
   // Skip cross-origin requests and non-GET methods
-  if (
-    !event.request.url.startsWith(self.location.origin) ||
-    event.request.method !== 'GET'
-  ) {
+  if (!request.url.startsWith(self.location.origin) || request.method !== 'GET') {
     return;
   }
 
-  // Network first strategy for API calls (with cache fallback)
-  if (event.request.url.includes('/api/')) {
-    event.respondWith(
-      fetch(event.request)
-        .then((response) => {
-          // Cache successful responses with TTL metadata
-          if (response && response.status === 200) {
-            putWithTimestamp(API_CACHE_NAME, event.request, response).catch((error) => {
-              console.warn('Failed to cache API response:', error);
-            });
-          }
-          return response;
-        })
-        .catch(async () => {
-          // Fall back to cache when offline
-          const cached = await caches.match(event.request);
-          if (cached) {
-            recordCacheHit();
-            return cached;
-          }
-          recordCacheMiss();
-          return new Response(
-            JSON.stringify({ error: 'Offline - no cached response available' }),
-            {
-              status: 503,
-              statusText: 'Service Unavailable',
-              headers: new Headers({ 'Content-Type': 'application/json' }),
-            }
-          );
-        })
-    );
+  const { pathname } = new URL(request.url);
+  if (pathname.startsWith(API_PATH_PREFIX)) {
+    event.respondWith(handleApiRequest(event));
     return;
   }
-
-  // Stale-while-revalidate strategy for static assets
-  event.respondWith(
-    caches.match(event.request).then((cachedResponse) => {
-      const networkFetch = fetch(event.request)
-        .then((response) => {
-          // Cache new static assets with TTL metadata
-          if (response && response.status === 200) {
-            putWithTimestamp(STATIC_CACHE_NAME, event.request, response).catch((error) => {
-              console.warn('Failed to cache static asset:', error);
-            });
-          }
-          return response;
-        })
-        .catch(() => {
-          // Return offline page if available
-          return caches.match('/offline.html').catch(() => {
-            return new Response('Offline - Unable to load', {
-              status: 503,
-              statusText: 'Service Unavailable',
-              headers: new Headers({
-                'Content-Type': 'text/plain',
-              }),
-            });
-          });
-        });
-
-      if (cachedResponse) {
-        recordCacheHit();
-        // Serve stale content immediately, revalidate in background
-        if (isExpired(cachedResponse, CACHE_TTLS.static)) {
-          recordRevalidation();
-          event.waitUntil(networkFetch.catch(() => undefined));
-        } else {
-          event.waitUntil(networkFetch.catch(() => undefined));
-        }
-        return cachedResponse;
-      }
-
-      recordCacheMiss();
-      return networkFetch;
-    })
-  );
+  if (request.mode === 'navigate') {
+    event.respondWith(handleNavigation(event));
+    return;
+  }
+  event.respondWith(handleStaticRequest(event));
 });
+
+/**
+ * Network first for API calls. A successful response replaces the cached
+ * copy; on failure or timeout the cached copy is served, marked with
+ * `x-sw-cache: offline`. With no usable copy, an offline 503 is returned.
+ */
+async function handleApiRequest(event) {
+  const { request } = event;
+  const network = fetch(request);
+  event.waitUntil(
+    network
+      .then((response) => {
+        if (isCacheableApiResponse(request, response)) {
+          return storeApiResponse(request, response.clone());
+        }
+        return undefined;
+      })
+      .catch(() => undefined)
+  );
+
+  try {
+    return await withTimeout(network, API_NETWORK_TIMEOUT_MS);
+  } catch (error) {
+    const cached = await matchFreshApiResponse(request);
+    if (cached) return cached;
+    if (error && error.name === 'TimeoutError') {
+      // Nothing cached: keep waiting on the slow network.
+      return network.catch(() => offlineApiResponse());
+    }
+    return offlineApiResponse();
+  }
+}
+
+/**
+ * Only plain, successful, same-origin responses to unauthenticated requests
+ * are stored, and never ones the server marks no-store or private.
+ */
+function isCacheableApiResponse(request, response) {
+  if (!response || response.status !== 200 || response.type !== 'basic') return false;
+  if (request.headers.has('authorization')) return false;
+  const cacheControl = response.headers.get('cache-control') || '';
+  return !/no-store|private/i.test(cacheControl);
+}
+
+async function storeApiResponse(request, response) {
+  const headers = new Headers(response.headers);
+  headers.set(CACHED_AT_HEADER, String(Date.now()));
+  const body = await response.blob();
+  const cache = await caches.open(API_CACHE);
+  // Delete first so the entry moves to the end and trimming stays oldest-first.
+  await cache.delete(request);
+  await cache.put(
+    request,
+    new Response(body, { status: response.status, statusText: response.statusText, headers })
+  );
+  await trimCache(cache, API_CACHE_MAX_ENTRIES);
+}
+
+async function matchFreshApiResponse(request) {
+  const cache = await caches.open(API_CACHE);
+  const cached = await cache.match(request);
+  if (!cached) return null;
+  const cachedAt = Number(cached.headers.get(CACHED_AT_HEADER));
+  if (!cachedAt || Date.now() - cachedAt > API_CACHE_MAX_AGE_MS) {
+    await cache.delete(request);
+    return null;
+  }
+  const headers = new Headers(cached.headers);
+  headers.set(CACHE_STATUS_HEADER, 'offline');
+  return new Response(cached.body, {
+    status: cached.status,
+    statusText: cached.statusText,
+    headers,
+  });
+}
+
+async function trimCache(cache, maxEntries) {
+  const keys = await cache.keys();
+  for (let i = 0; i < keys.length - maxEntries; i++) {
+    await cache.delete(keys[i]);
+  }
+}
+
+function offlineApiResponse() {
+  return new Response(
+    JSON.stringify({ code: 'OFFLINE', message: 'You are offline and this data has not been cached yet.' }),
+    {
+      status: 503,
+      statusText: 'Service Unavailable',
+      headers: { 'Content-Type': 'application/json', [CACHE_STATUS_HEADER]: 'miss' },
+    }
+  );
+}
+
+/**
+ * Network first for page loads so a deploy is picked up immediately; the
+ * cached app shell is served when offline. Every route serves the same
+ * shell (see _redirects), so it is cached under one key.
+ */
+async function handleNavigation(event) {
+  try {
+    const response = await fetch(event.request);
+    if (response && response.status === 200 && response.type === 'basic') {
+      const copy = response.clone();
+      event.waitUntil(caches.open(STATIC_CACHE).then((cache) => cache.put(APP_SHELL_URL, copy)));
+    }
+    return response;
+  } catch {
+    const shell = (await caches.match(APP_SHELL_URL)) || (await caches.match('/'));
+    return shell || offlineTextResponse();
+  }
+}
+
+// Cache first strategy for static assets
+async function handleStaticRequest(event) {
+  const cached = await caches.match(event.request);
+  if (cached) return cached;
+  try {
+    const response = await fetch(event.request);
+    if (response && response.status === 200 && response.type === 'basic') {
+      const copy = response.clone();
+      event.waitUntil(caches.open(STATIC_CACHE).then((cache) => cache.put(event.request, copy)));
+    }
+    return response;
+  } catch {
+    return offlineTextResponse();
+  }
+}
+
+function offlineTextResponse() {
+  return new Response('Offline - Unable to load', {
+    status: 503,
+    statusText: 'Service Unavailable',
+    headers: new Headers({
+      'Content-Type': 'text/plain',
+    }),
+  });
+}
+
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const error = new Error(`Network did not respond within ${ms}ms`);
+      error.name = 'TimeoutError';
+      reject(error);
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
 
 // Background sync for offline data
 self.addEventListener('sync', (event) => {
@@ -325,36 +426,9 @@ self.addEventListener('message', (event) => {
   if (event.data.type === 'SKIP_WAITING') {
     self.skipWaiting();
   }
-
-  // Report cache hit rate monitoring stats to clients
-  if (event.data.type === 'GET_CACHE_STATS') {
-    event.source?.postMessage({
-      type: 'CACHE_STATS',
-      stats: {
-        ...cacheStats,
-        hitRate: getCacheHitRate(),
-      },
-    });
-  }
-
-  // Cache invalidation pipeline: purge a specific URL or all caches
-  if (event.data.type === 'INVALIDATE_CACHE') {
-    event.waitUntil(
-      (async () => {
-        if (event.data.url) {
-          await Promise.all([
-            caches.open(STATIC_CACHE_NAME).then((cache) => cache.delete(event.data.url)),
-            caches.open(API_CACHE_NAME).then((cache) => cache.delete(event.data.url)),
-          ]);
-        } else {
-          await Promise.all([
-            caches.delete(STATIC_CACHE_NAME),
-            caches.delete(API_CACHE_NAME),
-          ]);
-        }
-        event.source?.postMessage({ type: 'CACHE_INVALIDATED', url: event.data.url || null });
-      })()
-    );
+  // Drop cached API data, e.g. when the wallet disconnects.
+  if (event.data && event.data.type === 'CLEAR_API_CACHE') {
+    event.waitUntil(caches.delete(API_CACHE));
   }
 });
 
