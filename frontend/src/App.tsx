@@ -8,6 +8,9 @@ import { useKeyboardShortcutsContext } from "./context/KeyboardShortcutsContext"
 import ViewTransition from "./components/ViewTransition";
 import VoiceCommandButton from "./components/VoiceCommandButton";
 import { useVoiceCommands, type VoiceCommand } from "./hooks/useVoiceCommands";
+import { CollaborationProvider } from "./collaboration/CollaborationProvider";
+import CollaborationPanel from "./collaboration/CollaborationPanel";
+import { COLLABORATION_CONFIG } from "./config/collaboration";
 
 // Tab panels are route-like application surfaces. Keep the initial identity
 // route small and fetch the credentials route only when it is needed.
@@ -86,6 +89,8 @@ function AppContent() {
   const [verifyId, setVerifyId] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [deepLinkEncrypted, setDeepLinkEncrypted] = useState<{ c: string; k: string } | null>(null);
+  // Credential currently open for collaborative editing (#1105).
+  const [activeCredentialId, setActiveCredentialId] = useState<string | null>(null);
   const networkConfig = NETWORK_CONFIGS[activeNetwork];
   const wallet = useWallet(networkConfig);
   useIdleSessionTimeout(wallet.connected, wallet.disconnect);
@@ -213,6 +218,21 @@ function AppContent() {
   useOpenGraphMeta(verifyMeta);
 
   const onMainnet = isMainnet(activeNetwork);
+
+  // The credential being edited is either the one opened via a verification
+  // deep link or the one selected inside the credentials panel.
+  const collaborationCredentialId = activeCredentialId ?? verifyId ?? null;
+  const collaborationUser = useMemo(
+    () =>
+      wallet.publicKey
+        ? {
+            id: wallet.publicKey,
+            name: wallet.publicKey.slice(0, 6),
+            role: COLLABORATION_CONFIG.defaultRole,
+          }
+        : null,
+    [wallet.publicKey],
+  );
 
   // Check RPC connection health on load
   useEffect(() => {
@@ -668,7 +688,13 @@ function AppContent() {
                     onClose={() => setScanning(false)}
                   />
                 )}
-                <CredentialsPanel verifyId={verifyId} />
+                <CredentialsPanel
+                  verifyId={verifyId}
+                  onSelectCredential={(id: string) => setActiveCredentialId(id)}
+                />
+                {collaborationCredentialId && (
+                  <CollaborationPanel credentialId={collaborationCredentialId} />
+                )}
               </>
             )}
           </div>
@@ -707,6 +733,15 @@ function AppContent() {
               />
             )}
           </div>
+          <div
+            id={`panel-${Tab.NetworkStatistics}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${Tab.NetworkStatistics}`}
+            data-tour="panel-network"
+            hidden={tab !== Tab.NetworkStatistics}
+          >
+            {tab === Tab.NetworkStatistics && <NetworkStatistics />}
+          </div>
           </ViewTransition>
           </Suspense>
         </ErrorBoundary>
@@ -730,7 +765,13 @@ function TourOverlayWrapper() {
 export default function App() {
   return (
     <TourProvider>
-      <AppContent />
+      <CollaborationProvider
+        websocketUrl={COLLABORATION_CONFIG.websocketUrl}
+        user={null}
+        defaultRole={COLLABORATION_CONFIG.defaultRole}
+      >
+        <AppContent />
+      </CollaborationProvider>
       <TourOverlayWrapper />
     </TourProvider>
   );

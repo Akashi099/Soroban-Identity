@@ -7,8 +7,6 @@ import type { Credential, DidDocument } from '../../../sdk/src/types';
 const DB_NAME = 'soroban-identity';
 const DB_VERSION = 3;
 
-const DASHBOARD_LAYOUT_STORAGE_PREFIX = 'soroban-identity:dashboard-layout:';
-
 export interface QueuedWriteOperation {
   id: string;
   type: 'issue_credential' | 'revoke_credential' | 'create_did' | 'update_did';
@@ -17,6 +15,17 @@ export interface QueuedWriteOperation {
   retryCount: number;
   status: 'pending' | 'processing' | 'failed';
   lastError?: string;
+}
+
+export interface CachedCredentialVersion {
+  id: string;
+  credentialId: string;
+  version: number;
+  credential: Credential;
+  createdAt: number;
+  note?: string;
+  parentVersionId?: string | null;
+  branch?: string;
 }
 
 function openDatabase(): Promise<IDBDatabase> {
@@ -37,8 +46,9 @@ function openDatabase(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains('dids')) {
         db.createObjectStore('dids', { keyPath: 'id' });
       }
-      if (!db.objectStoreNames.contains('dashboard-layouts')) {
-        db.createObjectStore('dashboard-layouts', { keyPath: 'address' });
+      if (!db.objectStoreNames.contains('credential-versions')) {
+        const versionStore = db.createObjectStore('credential-versions', { keyPath: 'id' });
+        versionStore.createIndex('credentialId', 'credentialId', { unique: false });
       }
     };
   });
@@ -123,6 +133,46 @@ export async function getAllCachedCredentials(): Promise<Credential[]> {
     const store = tx.objectStore('credentials');
     const req = store.getAll();
     req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// ── Credential Version History ──────────────────────────────────────────────
+
+export async function cacheCredentialVersion(version: CachedCredentialVersion): Promise<void> {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(['credential-versions'], 'readwrite');
+    const store = tx.objectStore('credential-versions');
+    const req = store.put(version);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function getCredentialVersions(credentialId: string): Promise<CachedCredentialVersion[]> {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(['credential-versions'], 'readonly');
+    const store = tx.objectStore('credential-versions');
+    const index = store.index('credentialId');
+    const req = index.getAll(credentialId);
+    req.onsuccess = () => {
+      const versions: CachedCredentialVersion[] = req.result || [];
+      versions.sort((a, b) => a.version - b.version);
+      resolve(versions);
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function deleteCredentialVersion(id: string): Promise<void> {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(['credential-versions'], 'readwrite');
+    const store = tx.objectStore('credential-versions');
+    const req = store.delete(id);
+    req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
   });
 }
