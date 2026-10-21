@@ -19,6 +19,22 @@ pub use suspension::{CredentialStatus, SuspensionReason, SuspensionRecord};
 mod bundle;
 pub use bundle::{BundleVerificationResult, CredentialBundle};
 
+mod revocation;
+pub use revocation::{
+    RevocationBitmapStats, RevocationProof, RevocationStats, RevocationStatus,
+};
+
+mod presentation;
+pub use presentation::{
+    PresentationChallenge, PresentationProofFormat, PresentationRecord, PresentationTemplate,
+    PresentationVerificationResult,
+};
+
+mod oracle;
+pub use oracle::{
+    DataFeedSchema, OracleConfig, OracleNode, OracleRequest, OracleResponse,
+};
+
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
@@ -141,6 +157,22 @@ const ESCROW_SEQ: Symbol = symbol_short!("ESCRSEQ");
 /// Reverse index: maps a depositor address to the escrow IDs they created.
 const ESCROW_BY_DEPOSITOR: Symbol = symbol_short!("ESCBYDEP");
 
+// ── Issue #1124: off-chain oracle integration storage keys ───────────────────
+/// Maps an oracle node address to its [`OracleConfig`].
+const ORACLE_CFG: Symbol = symbol_short!("ORACLECFG");
+/// Maps a feed id to its [`DataFeedSchema`].
+const ORACLE_FEED: Symbol = symbol_short!("ORACLFEED");
+/// Maps a request id to its [`OracleRequest`].
+const ORACLE_REQ: Symbol = symbol_short!("ORACLREQ");
+/// Maps a request id to its [`OracleResponse`] once fulfilled.
+const ORACLE_RESP: Symbol = symbol_short!("ORACLRESP");
+/// Maps a feed id to its configured fallback oracle nodes.
+const ORACLE_FALLBACK: Symbol = symbol_short!("ORACLFALL");
+/// Maps a feed id to the configured oracle fee.
+const ORACLE_FEE: Symbol = symbol_short!("ORACLFEE");
+/// Sequence number for generating unique oracle request IDs.
+const ORACLE_SEQ: Symbol = symbol_short!("ORACLSEQ");
+
 #[contracterror]
 #[derive(Clone, Debug, PartialEq, Copy)]
 pub enum ContractError {
@@ -164,6 +196,10 @@ pub enum ContractError {
     BatchTooLarge = 17,
     InvalidSchemaHash = 18,
     ContractPaused = 19,
+    InvalidInput = 21,
+    NotFound = 22,
+    NotWhitelisted = 23,
+    RefundWindowClosed = 24,
     /// Issue #551: a guarded function was re-entered while a prior
     /// invocation (which is mid cross-contract call) had not yet completed.
     ReentrantCall = 20,
@@ -218,6 +254,36 @@ pub enum ContractError {
     BundleNotFound = 53,
     /// Issue #1058: credential bundle must contain at least one credential.
     EmptyBundle = 54,
+    /// Issue #1124: the oracle node is not registered.
+    OracleNotFound = 55,
+    /// Issue #1124: the data feed schema is not registered.
+    FeedSchemaNotFound = 56,
+    /// Issue #1124: the oracle request was not found.
+    OracleRequestNotFound = 57,
+    /// Issue #1124: the oracle response is stale (older than the feed's max age).
+    StaleOracleData = 58,
+    /// Issue #1124: the oracle request has already been fulfilled.
+    OracleRequestAlreadyFulfilled = 59,
+    /// Issue #1124: the caller is not an authorized oracle node for this feed.
+    UnauthorizedOracle = 60,
+    /// Issue #1121: the revocation bitmap page index is out of range.
+    InvalidRevocationPage = 61,
+    /// Issue #1121: the requested revocation proof could not be produced.
+    RevocationProofNotFound = 62,
+    /// Issue #1123: the verifiable presentation was not found.
+    PresentationNotFound = 63,
+    /// Issue #1123: the presentation contains no credentials.
+    EmptyPresentation = 64,
+    /// Issue #1123: the presentation challenge is missing, expired, or mismatched.
+    InvalidPresentationChallenge = 65,
+    /// Issue #1123: the presentation has expired.
+    PresentationExpired = 66,
+    /// Issue #1123: the presentation proof format is unsupported.
+    UnsupportedPresentationProof = 67,
+    /// Issue #1123: the presentation failed verification.
+    PresentationVerificationFailed = 68,
+    /// Issue #1123: the presentation template was not found.
+    PresentationTemplateNotFound = 69,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -549,6 +615,11 @@ impl<'a> Drop for ReentrancyGuard<'a> {
 
 #[contract]
 pub struct CredentialManager;
+
+mod crl;
+mod encryption;
+mod external_verify;
+mod pricing;
 
 #[contractimpl]
 impl CredentialManager {
@@ -1505,6 +1576,204 @@ impl CredentialManager {
         current == expected
     }
 
+    // ── Issue #1121: bitmap-based credential revocation list ─────────────────
+
+    /// Revokes a batch of credentials, recording each one in the issuer's
+    /// bitmap-based revocation list. Returns the number of credentials newly
+    /// revoked (already-revoked entries are skipped).
+    ///
+    /// Emits a `revbatch` event summarising the operation.
+    pub fn revoke_credentials_batch(
+        env: Env,
+        issuer: Address,
+        credential_ids: Vec<BytesN<32>>,
+        reason: RevocationReason,
+    ) -> Result<u32, ContractError> {
+        issuer.require_auth();
+        Self::require_not_paused(&env)?;
+        Self::require_issuer(&env, &issuer)?;
+        if credential_ids.len() == 0 || credential_ids.len() > MAX_VERIFY_BATCH {
+            return Err(ContractError::BatchTooLarge);
+        }
+
+        let mut revoked_count: u32 = 0;
+        for credential_id in credential_ids.iter() {
+            let key = Self::cred_key(&credential_id);
+            let mut cred: Credential = match env.storage().persistent().get(&key) {
+                Some(c) => c,
+                None => continue,
+            };
+            if cred.issuer != issuer || cred.revoked {
+                continue;
+            }
+            cred.revoked = true;
+            env.storage().persistent().set(&key, &cred);
+            revocation::mark_revoked(&env, &issuer, &credential_id, reason as u32);
+            revoked_count += 1;
+        }
+
+        env.events().publish(
+            (CRED, symbol_short!("revbatch")),
+            (
+                EVENT_VERSION,
+                issuer,
+                credential_ids.len(),
+                revoked_count,
+                reason as u32,
+            ),
+        );
+        Ok(revoked_count)
+    }
+
+    /// Returns whether `credential_id` appears in the issuer's bitmap-based
+    /// revocation list.
+    pub fn is_revoked_bitmap(
+        env: Env,
+        issuer: Address,
+        credential_id: BytesN<32>,
+    ) -> bool {
+        revocation::is_revoked(&env, &issuer, &credential_id)
+    }
+
+    /// Generates a Merkle-style revocation proof for `credential_id` from the
+    /// issuer's bitmap-based revocation list.
+    pub fn get_revocation_proof(
+        env: Env,
+        issuer: Address,
+        credential_id: BytesN<32>,
+    ) -> Result<RevocationProof, ContractError> {
+        revocation::build_proof(&env, &issuer, &credential_id)
+            .ok_or(ContractError::RevocationProofNotFound)
+    }
+
+    /// Verifies a revocation proof against the issuer's current bitmap state.
+    pub fn verify_revocation_proof(
+        env: Env,
+        issuer: Address,
+        proof: RevocationProof,
+    ) -> bool {
+        revocation::verify_proof(&env, &issuer, &proof)
+    }
+
+    /// Returns aggregate revocation statistics for `issuer`.
+    pub fn get_revocation_stats(env: Env, issuer: Address) -> RevocationStats {
+        revocation::stats(&env, &issuer)
+    }
+
+    /// Returns low-level bitmap page statistics for `issuer`.
+    pub fn get_revocation_bitmap_stats(
+        env: Env,
+        issuer: Address,
+    ) -> RevocationBitmapStats {
+        revocation::bitmap_stats(&env, &issuer)
+    }
+
+    // ── Issue #1123: verifiable presentations ────────────────────────────────
+
+    /// Creates a verifiable presentation bundling `credential_ids` under
+    /// `holder`. The presentation is stored and its id returned.
+    ///
+    /// Emits a `presnew` event.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_presentation(
+        env: Env,
+        holder: Address,
+        credential_ids: Vec<BytesN<32>>,
+        proof_format: PresentationProofFormat,
+        challenge: Option<BytesN<32>>,
+        expires_at: u64,
+        disclosed_claims: Vec<String>,
+    ) -> Result<BytesN<32>, ContractError> {
+        holder.require_auth();
+        Self::require_not_paused(&env)?;
+        if credential_ids.len() == 0 {
+            return Err(ContractError::EmptyPresentation);
+        }
+        let now = env.ledger().timestamp();
+        if expires_at != 0 && expires_at <= now {
+            return Err(ContractError::PresentationExpired);
+        }
+        let presentation_id = presentation::create(
+            &env,
+            &holder,
+            &credential_ids,
+            proof_format,
+            challenge,
+            expires_at,
+            disclosed_claims,
+        );
+        env.events().publish(
+            (CRED, symbol_short!("presnew")),
+            (EVENT_VERSION, presentation_id.clone(), holder, credential_ids.len()),
+        );
+        Ok(presentation_id)
+    }
+
+    /// Returns the stored presentation record for `presentation_id`.
+    pub fn get_presentation(
+        env: Env,
+        presentation_id: BytesN<32>,
+    ) -> Result<PresentationRecord, ContractError> {
+        presentation::get(&env, &presentation_id)
+            .ok_or(ContractError::PresentationNotFound)
+    }
+
+    /// Verifies a stored presentation, checking expiry, challenge, and the
+    /// revocation status of every bundled credential.
+    ///
+    /// Emits a `presvrfy` event.
+    pub fn verify_presentation(
+        env: Env,
+        presentation_id: BytesN<32>,
+        challenge: Option<BytesN<32>>,
+    ) -> Result<PresentationVerificationResult, ContractError> {
+        let result = presentation::verify(&env, &presentation_id, challenge)?;
+        env.events().publish(
+            (CRED, symbol_short!("presvrfy")),
+            (EVENT_VERSION, presentation_id, result.valid),
+        );
+        Ok(result)
+    }
+
+    /// Registers a reusable presentation template owned by `holder`.
+    ///
+    /// Emits a `prestmpl` event.
+    pub fn register_presentation_template(
+        env: Env,
+        holder: Address,
+        template_id: BytesN<32>,
+        name: String,
+        proof_format: PresentationProofFormat,
+        required_claims: Vec<String>,
+        validity_secs: u64,
+    ) -> Result<(), ContractError> {
+        holder.require_auth();
+        Self::require_not_paused(&env)?;
+        presentation::register_template(
+            &env,
+            &holder,
+            &template_id,
+            name,
+            proof_format,
+            required_claims,
+            validity_secs,
+        );
+        env.events().publish(
+            (CRED, symbol_short!("prestmpl")),
+            (EVENT_VERSION, template_id, holder),
+        );
+        Ok(())
+    }
+
+    /// Returns the stored presentation template for `template_id`.
+    pub fn get_presentation_template(
+        env: Env,
+        template_id: BytesN<32>,
+    ) -> Result<PresentationTemplate, ContractError> {
+        presentation::get_template(&env, &template_id)
+            .ok_or(ContractError::PresentationTemplateNotFound)
+    }
+
     /// Revoke a credential. Equivalent to
     /// [`Self::revoke_credential_with_reason`]; kept for backwards compatibility.
     pub fn revoke_credential(
@@ -2424,6 +2693,120 @@ impl CredentialManager {
                 .extend_ttl(&cnt_key, TTL_MAX, TTL_MAX);
         }
         env.storage().persistent().get(&cnt_key).unwrap_or(0)
+    }
+
+    // ── Issue #1124: off-chain oracle integration ─────────────────────────────
+
+    /// Registers (or updates) an oracle node. Admin only.
+    pub fn register_oracle(
+        env: Env,
+        admin: Address,
+        node: Address,
+        endpoint: String,
+        active: bool,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(ContractError::NotInitialized)?;
+        if stored != admin {
+            return Err(ContractError::Unauthorized);
+        }
+        oracle::register_oracle(&env, &node, endpoint, active);
+        Ok(())
+    }
+
+    /// Defines (or updates) the data feed schema for a feed id. Admin only.
+    pub fn set_feed_schema(
+        env: Env,
+        admin: Address,
+        feed_id: Symbol,
+        schema: DataFeedSchema,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(ContractError::NotInitialized)?;
+        if stored != admin {
+            return Err(ContractError::Unauthorized);
+        }
+        oracle::set_feed_schema(&env, &feed_id, schema);
+        Ok(())
+    }
+
+    /// Configures the oracle fee charged per request for a feed. Admin only.
+    pub fn set_oracle_fee(
+        env: Env,
+        admin: Address,
+        feed_id: Symbol,
+        fee: i128,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(ContractError::NotInitialized)?;
+        if stored != admin {
+            return Err(ContractError::Unauthorized);
+        }
+        oracle::set_oracle_fee(&env, &feed_id, fee);
+        Ok(())
+    }
+
+    /// Configures the ordered list of fallback oracle nodes for a feed. Admin only.
+    pub fn set_fallback_oracles(
+        env: Env,
+        admin: Address,
+        feed_id: Symbol,
+        fallbacks: Vec<Address>,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(ContractError::NotInitialized)?;
+        if stored != admin {
+            return Err(ContractError::Unauthorized);
+        }
+        oracle::set_fallback_oracles(&env, &feed_id, fallbacks);
+        Ok(())
+    }
+
+    /// Creates an off-chain data request against a registered feed schema.
+    /// Returns the generated request id.
+    pub fn request_offchain_data(
+        env: Env,
+        requester: Address,
+        feed_id: Symbol,
+        payload: Bytes,
+    ) -> Result<BytesN<32>, ContractError> {
+        requester.require_auth();
+        Self::require_not_paused(&env)?;
+        oracle::request_offchain_data(&env, &requester, &feed_id, payload)
+    }
+
+    /// Fulfils a pending oracle request. Only an authorized oracle node (the
+    /// primary or a configured fallback) may call this.
+    pub fn oracle_callback(
+        env: Env,
+        node: Address,
+        request_id: BytesN<32>,
+        data: Bytes,
+    ) -> Result<(), ContractError> {
+        node.require_auth();
+        oracle::oracle_callback(&env, &node, &request_id, data)
+    }
+
+    /// Returns whether the stored response for `request_id` is still fresh
+    /// according to the feed's configured max age.
+    pub fn is_response_fresh(env: Env, request_id: BytesN<32>) -> bool {
+        oracle::is_response_fresh(&env, &request_id)
     }
 
     pub fn get_issuers(env: Env) -> Vec<Address> {

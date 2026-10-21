@@ -27,10 +27,14 @@ const preloadNetworkStatistics = () => {
   void import("./components/NetworkStatistics");
 };
 import WalletButton from "./components/WalletButton";
+import QRScanner from "./components/QRScanner";
+import { TourProvider, useTour } from "./context/TourContext";
+import TourOverlay from "./components/TourOverlay";
 import ErrorBoundary from "./components/ErrorBoundary";
 import Toast from "./components/Toast";
 import { ToastProvider } from "./context/ToastContext";
 import { useWallet } from "./hooks/useWallet";
+import { useIdleSessionTimeout } from "./hooks/useIdleSessionTimeout";
 import { useCredentialExpiryCheck } from "./hooks/useCredentialExpiryCheck";
 import { useTheme, cycleTheme, getThemeIcon, getThemeLabel } from "./hooks/useTheme";
 import { useServiceWorker } from "./hooks/useServiceWorker";
@@ -73,6 +77,7 @@ function AppContent() {
   const [deepLinkEncrypted, setDeepLinkEncrypted] = useState<{ c: string; k: string } | null>(null);
   const networkConfig = NETWORK_CONFIGS[activeNetwork];
   const wallet = useWallet(networkConfig);
+  useIdleSessionTimeout(wallet.connected, wallet.disconnect);
   const [theme, setTheme, isDarkMode] = useTheme();
   const { t, i18n } = useTranslation();
   const [isConnected, setIsConnected] = useState<boolean | null>(null);
@@ -98,7 +103,7 @@ function AppContent() {
       {
         phrases: ["navigate", "go to", "open", "navegar", "aller", "导航"],
         description: t("voice.commands.navigate"),
-        handler: (transcript) => {
+        handler: (transcript: string) => {
           const target = transcript.toLowerCase();
           if (target.includes("credential")) {
             setTab(Tab.Credentials);
@@ -447,7 +452,7 @@ function AppContent() {
             </span>
           )}
           <VoiceCommandButton voice={voice} />
-          <WalletButton wallet={wallet} />
+          <WalletButton />
         </div>
         <div
           className={`mobile-drawer-backdrop${menuOpen ? " open" : ""}`}
@@ -639,7 +644,7 @@ function AppContent() {
                 </button>
                 {scanning && (
                   <QRScanner
-                    onVerify={(id) => {
+                    onVerify={(id: string) => {
                       setVerifyId(id);
                       setScanning(false);
                     }}
@@ -677,11 +682,22 @@ function AppContent() {
   );
 }
 
+function TourOverlayWrapper() {
+  const { status, path, skip, complete } = useTour();
+  return (
+    <TourOverlay
+      open={status === 'active'}
+      path={path}
+      onClose={(reason) => (reason === 'skipped' ? skip() : complete())}
+    />
+  );
+}
+
 export default function App() {
   return (
     <TourProvider>
       <AppContent />
-      <TourOverlay />
+      <TourOverlayWrapper />
     </TourProvider>
   );
 }

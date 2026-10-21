@@ -76,8 +76,8 @@ export interface UseVoiceCommandsOptions extends VoiceCommandHandlers {
   speakFeedback?: boolean;
   /** Whether to automatically request microphone permission on mount. Defaults to false. */
   autoRequestPermission?: boolean;
-  /** Custom localized command phrases, overriding the i18n defaults or providing custom action handlers. */
-  commands?: VoiceCommand[] | Partial<Record<VoiceCommandAction, string[]>>;
+  /** Custom localized command phrases or VoiceCommand array, overriding the i18n defaults. */
+  commands?: Partial<Record<VoiceCommandAction, string[]>> | VoiceCommand[];
 }
 
 export interface UseVoiceCommandsResult {
@@ -332,6 +332,8 @@ export function useVoiceCommands(
       }) as unknown as string[],
     };
 
+    const dictCommands = Array.isArray(customCommands) ? undefined : customCommands;
+
     const ensureArray = (value: unknown, fallback: string[]): string[] => {
       if (Array.isArray(value)) return value.filter((v): v is string => typeof v === 'string');
       if (typeof value === 'string') return [value];
@@ -341,14 +343,19 @@ export function useVoiceCommands(
     const recordCommands = (!Array.isArray(customCommands) ? customCommands : undefined);
 
     return {
-      search: ensureArray(recordCommands?.search ?? localized.search, DEFAULT_COMMANDS.search),
+      search: ensureArray(dictCommands?.search ?? localized.search, DEFAULT_COMMANDS.search),
       navigate: ensureArray(
-        recordCommands?.navigate ?? localized.navigate,
+        dictCommands?.navigate ?? localized.navigate,
         DEFAULT_COMMANDS.navigate,
       ),
-      verify: ensureArray(recordCommands?.verify ?? localized.verify, DEFAULT_COMMANDS.verify),
+      verify: ensureArray(dictCommands?.verify ?? localized.verify, DEFAULT_COMMANDS.verify),
     };
   }, [i18n, resolvedLang, customCommands]);
+
+  const customCommandsListRef = useRef<VoiceCommand[]>([]);
+  useEffect(() => {
+    customCommandsListRef.current = Array.isArray(customCommands) ? customCommands : [];
+  }, [customCommands]);
 
   const commandRegistryRef = useRef(commandRegistry);
   useEffect(() => {
@@ -457,27 +464,18 @@ export function useVoiceCommands(
       setFinalTranscript(transcript);
       setInterimTranscript('');
 
-      let matchedCustom = false;
-      if (Array.isArray(customCommandsRef.current)) {
+      if (customCommandsListRef.current.length > 0) {
         const norm = normalize(transcript);
-        for (const cmd of customCommandsRef.current) {
-          const matchPhrase = cmd.phrases.find((p) => {
-            const normP = normalize(p);
-            return norm.includes(normP) || norm.startsWith(normP);
-          });
-          if (matchPhrase) {
-            matchedCustom = true;
-            cmd.handler(transcript);
-            if (speakFeedbackRef.current && cmd.description) {
-              speakRef.current(cmd.description);
-            }
-            break;
+        const customMatch = customCommandsListRef.current.find((cmd) =>
+          cmd.phrases.some((p) => norm.includes(normalize(p)))
+        );
+        if (customMatch) {
+          customMatch.handler(transcript);
+          if (speakFeedbackRef.current && customMatch.description) {
+            speakRef.current(customMatch.description);
           }
+          return;
         }
-      }
-
-      if (matchedCustom) {
-        return;
       }
 
       const match = matchCommand(transcript, commandRegistryRef.current);

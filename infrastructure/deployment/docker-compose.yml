@@ -44,21 +44,24 @@ x-postgres: &postgres
     retries: 5
     start_period: 20s
 
+# Shared environment for each regional standby.
+x-replica-env: &replica-env
+  POSTGRES_USER: ${POSTGRES_USER:-soroban}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-soroban}
+  POSTGRES_DB: ${POSTGRES_DB:-soroban_identity}
+  PGUSER: ${POSTGRES_USER:-soroban}
+  PGPASSWORD: ${POSTGRES_PASSWORD:-soroban}
+  PRIMARY_HOST: primary-db
+  PRIMARY_PORT: "5432"
+  REPLICATION_USER: ${REPLICATION_USER:-replicator}
+  REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replicator}
+
 # Read replica template. Each replica streams from the primary and is
 # read-only; the API routes reads to the nearest healthy replica.
 x-replica: &replica
   <<: *postgres
   environment:
-    POSTGRES_USER: ${POSTGRES_USER:-soroban}
-    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-soroban}
-    POSTGRES_DB: ${POSTGRES_DB:-soroban_identity}
-    # Marks this instance as a streaming replica of primary-db.
-    PGUSER: ${POSTGRES_USER:-soroban}
-    PGPASSWORD: ${POSTGRES_PASSWORD:-soroban}
-    PRIMARY_HOST: primary-db
-    PRIMARY_PORT: "5432"
-    REPLICATION_USER: ${REPLICATION_USER:-replicator}
-    REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replicator}
+    <<: *replica-env
   # Replicas are read-only; writes are rejected and must go to the primary.
   command: >
     postgres
@@ -171,6 +174,20 @@ services:
       replica-eu:
         condition: service_healthy
       replica-asia:
+        condition: service_healthy
+
+  # Stable entry point. traffic-switch.sh replaces the upstream include and
+  # reloads Nginx gracefully, leaving established requests to drain.
+  router:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports: ["127.0.0.1:8080:8080"]
+    volumes:
+      - ./nginx:/etc/nginx:ro
+    depends_on:
+      blue:
+        condition: service_healthy
+      green:
         condition: service_healthy
 
 volumes:

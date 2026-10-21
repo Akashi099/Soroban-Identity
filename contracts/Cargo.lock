@@ -259,6 +259,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "credential-extensions"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "credential-manager"
 version = "0.1.0"
 dependencies = [
