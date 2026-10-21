@@ -664,6 +664,15 @@ function AppContent() {
           >
             {tab === Tab.IssuerAnalytics && <IssuerDashboard />}
           </div>
+          <div
+            id={`panel-${Tab.NetworkStatistics}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${Tab.NetworkStatistics}`}
+            data-tour="panel-network"
+            hidden={tab !== Tab.NetworkStatistics}
+          >
+            {tab === Tab.NetworkStatistics && <NetworkStatistics />}
+          </div>
           </ViewTransition>
           </Suspense>
         </ErrorBoundary>
